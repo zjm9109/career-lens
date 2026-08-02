@@ -1,0 +1,64 @@
+{
+  "manifest_version": 3,
+  "name": "career-lens",
+  "version": "0.2.0",
+  "description": "Boss/猎聘/智联粗筛后的本地精筛：避雷 / 加分 / 多模型分析 / 导出",
+  "permissions": ["storage", "sidePanel", "downloads", "scripting", "tabs", "activeTab"],
+  "host_permissions": [
+    "https://www.zhipin.com/*",
+    "https://www.bosszhipin.com/*",
+    "https://*.liepin.com/*",
+    "https://www.liepin.com/*",
+    "https://*.zhaopin.com/*",
+    "https://www.zhaopin.com/*",
+    "https://sou.zhaopin.com/*",
+    "https://api.deepseek.com/*",
+    "https://dashscope.aliyuncs.com/*",
+    "https://api.hunyuan.cloud.tencent.com/*",
+    "https://api.openai.com/*",
+    "https://generativelanguage.googleapis.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "side_panel": {
+    "default_path": "sidepanel/index.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.zhipin.com/*", "https://www.bosszhipin.com/*"],
+      "js": ["platforms/boss/content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://*.liepin.com/*", "https://www.liepin.com/*"],
+      "js": ["platforms/liepin/content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://*.zhaopin.com/*", "https://www.zhaopin.com/*", "https://sou.zhaopin.com/*"],
+      "js": ["platforms/zhilian/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "打开 career-lens",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["vendor/pdfjs/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

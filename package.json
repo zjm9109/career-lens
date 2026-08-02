@@ -1,0 +1,27 @@
+{
+  "name": "career-lens",
+  "version": "1.0.0",
+  "description": "Boss 粗筛之后的本地精筛扩展：避雷 / 注意 / 加分打分 →（可选）DeepSeek 分析 → 导出 Markdown。不自动投递。",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zjm9109/career-lens.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "private": true,
+  "bugs": {
+    "url": "https://github.com/zjm9109/career-lens/issues"
+  },
+  "homepage": "https://github.com/zjm9109/career-lens#readme",
+  "dependencies": {
+    "pdfjs-dist": "^4.10.38"
+  }
+}

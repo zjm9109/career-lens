@@ -1,0 +1,13 @@
+.DS_Store
+node_modules/
+*.log
+.idea/
+.vscode/
+.env
+.env.*
+*.pem
+# 个人简历等隐私文件，勿提交
+docs/*.pdf
+docs/*.docx
+!docs/SPEC.md
+!docs/TECH.md

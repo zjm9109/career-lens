@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>career-lens</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="header">
+    <div>
+      <h1>career-lens</h1>
+      <p class="sub">粗筛列表 → 本地精筛 · <span id="platformLabel">未识别平台</span></p>
+    </div>
+    <span id="statusPill" class="pill">空闲</span>
+  </header>
+
+  <nav class="tabs">
+    <button type="button" class="tab active" data-tab="run">开始执行</button>
+    <button type="button" class="tab" data-tab="profile">简历画像</button>
+    <button type="button" class="tab" data-tab="settings">模型设置</button>
+    <button type="button" class="tab" data-tab="manual">精确分析</button>
+    <button type="button" class="tab" data-tab="apply">投递列表</button>
+  </nav>
+
+  <main>
+    <section id="tab-run" class="panel active">
+      <p class="hint">打开招聘列表筛选后开始。同一列表未改筛时，再次开始会从上次位置接着往后跑。列表变了或点「从头」才从第 1 条重来。中途中断用「续跑」。</p>
+      <div class="row">
+        <label>本批条数
+          <select id="batchSize"></select>
+        </label>
+        <label>分析阈值
+          <input id="deepseekThreshold" type="number" min="0" max="100" title="≥该分且未避雷才调模型分析" />
+        </label>
+        <label>收藏阈值
+          <input id="favoriteThreshold" type="number" min="0" max="100" title="≥该分且未避雷则尝试自动收藏（已收藏不取消）" />
+        </label>
+      </div>
+      <div class="row row-2">
+        <label>导出内容
+          <select id="exportMode">
+            <option value="simple">精简（关键信息与分析结果）</option>
+            <option value="detailed">详细（含职责/任职分块）</option>
+          </select>
+        </label>
+        <label>导出格式
+          <select id="exportFormat">
+            <option value="md">Markdown (.md)</option>
+            <option value="docx">Word (.docx)</option>
+          </select>
+        </label>
+      </div>
+      <div class="actions">
+        <button type="button" id="btnStart" class="primary">开始精筛</button>
+        <button type="button" id="btnContinue" class="secondary" disabled title="从断点继续本批">续跑</button>
+        <button type="button" id="btnResetList" class="link" title="清空列表游标，下次从第 1 条开始">从头</button>
+        <button type="button" id="btnPause" disabled>暂停</button>
+        <button type="button" id="btnResume" disabled>继续</button>
+        <button type="button" id="btnStop" disabled>停止</button>
+        <button type="button" id="btnExport">导出</button>
+      </div>
+      <div id="progress" class="progress">尚未开始</div>
+      <div id="deepseekStats" class="deepseek-stats">模型：0 次 · 预估 ¥0.00</div>
+      <div class="log-wrap">
+        <div class="log-head">
+          <span>日志</span>
+          <button type="button" id="btnClearLog" class="link">清空</button>
+        </div>
+        <pre id="log" class="log"></pre>
+      </div>
+      <div class="results-wrap">
+        <div class="log-head results-head-sticky"><span>本批结果</span><span id="resultCount">0</span></div>
+        <div id="resultList" class="result-list"></div>
+      </div>
+    </section>
+
+    <section id="tab-profile" class="panel">
+      <div class="profile-scroll">
+        <label class="block">上传简历（PDF / DOCX / TXT）预填
+          <input id="resumeFile" type="file" accept=".pdf,.docx,.txt,.md" />
+        </label>
+        <p class="hint">PDF 使用本地 pdf.js 提取中文。点「从文本提取标签」可预填技能等，并尝试识别工作年限（请核对）。</p>
+        <label class="block">简历文本（可改，右下角可上下拖拽拉伸）
+          <textarea id="resumeText" class="resume-text" rows="12" placeholder="粘贴或上传解析后的简历文本"></textarea>
+        </label>
+        <div class="actions">
+          <button type="button" id="btnSuggest" class="secondary">从文本提取标签</button>
+        </div>
+
+        <label class="block">工作年限（年，必填，0–50 整数）
+          <input id="yearsExperience" type="number" min="0" max="50" step="1" required placeholder="如 8" />
+        </label>
+
+        <p class="hint">每项右侧为该维权重。修改后须点「确认权重」，合计必须为 100 才生效；否则沿用上次已确认的权重。岗位无某维要求时该维中性 100 属正常。</p>
+
+        <div class="field-weight">
+          <label class="grow">技能标签（逗号/换行分隔，可拉伸）
+            <textarea id="skills" class="tag-area" rows="2" placeholder="项目管理, 实施交付, Java"></textarea>
+          </label>
+          <label class="w-mini">权重
+            <input id="wSkill" class="weight-input" type="number" min="0" max="100" step="1" />
+          </label>
+        </div>
+
+        <div class="field-weight">
+          <label class="grow">行业标签
+            <textarea id="industries" class="tag-area" rows="2" placeholder="金融, 证券, 互联网"></textarea>
+          </label>
+          <label class="w-mini">权重
+            <input id="wIndustry" class="weight-input" type="number" min="0" max="100" step="1" />
+          </label>
+        </div>
+
+        <div class="field-weight">
+          <label class="grow">目标方向词
+            <textarea id="directions" class="tag-area" rows="2" placeholder="项目经理, PMO, 交付经理"></textarea>
+          </label>
+          <label class="w-mini">权重
+            <input id="wDirection" class="weight-input" type="number" min="0" max="100" step="1" />
+          </label>
+        </div>
+
+        <div class="field-weight">
+          <label class="grow">证书标签
+            <textarea id="certificates" class="tag-area" rows="2" placeholder="PMP, 软考"></textarea>
+          </label>
+          <label class="w-mini">权重
+            <input id="wCertificate" class="weight-input" type="number" min="0" max="100" step="1" />
+          </label>
+        </div>
+
+        <div class="field-weight">
+          <label class="grow">语言标签
+            <textarea id="languages" class="tag-area" rows="2" placeholder="英语, 英语六级"></textarea>
+          </label>
+          <label class="w-mini">权重
+            <input id="wLanguage" class="weight-input" type="number" min="0" max="100" step="1" />
+          </label>
+        </div>
+        <div class="weight-actions">
+          <span id="weightSumHint" class="weight-sum">合计：100 / 100</span>
+          <button type="button" id="btnConfirmWeights" class="secondary">确认权重</button>
+        </div>
+
+        <h3>避雷项（默认不选；命中则排除且不调模型）</h3>
+        <div id="avoidBox" class="tag-box"></div>
+        <label class="block">自定义避雷（逗号分隔）
+          <input id="avoidCustom" type="text" />
+        </label>
+
+        <h3>注意项（仅提醒，不影响分析和打分）</h3>
+        <div id="attentionBox" class="tag-box"></div>
+        <label class="block">自定义注意（逗号分隔）
+          <input id="attentionCustom" type="text" />
+        </label>
+      </div>
+      <div class="sticky-save">
+        <button type="button" id="btnSaveProfile" class="primary">保存画像</button>
+      </div>
+    </section>
+
+    <section id="tab-settings" class="panel">
+      <div class="settings-scroll">
+        <h3>分析模型（单选一家）</h3>
+        <p class="hint">国产：DeepSeek、通义千问、腾讯混元；国外：OpenAI、Gemini。只启用选中的一家。导出选项在「开始执行」页。</p>
+        <div id="llmProviderBox" class="llm-provider-box"></div>
+        <div id="llmKeyFields" class="llm-key-fields"></div>
+        <p class="hint">费用预估按调用次数粗算，非实际账单。加分权重在「简历画像」页。</p>
+      </div>
+      <div class="sticky-save">
+        <button type="button" id="btnSaveSettings" class="primary">保存模型设置</button>
+      </div>
+    </section>
+
+    <section id="tab-manual" class="panel">
+      <p class="hint">岗位名称必填；公司与链接可选。粘贴岗位正文后分析，达标会写入投递列表。</p>
+      <label class="block">岗位名称（必填）
+        <input id="manualTitle" type="text" required placeholder="如 项目经理" />
+      </label>
+      <div class="row row-2">
+        <label>公司名称（可选）
+          <input id="manualCompany" type="text" placeholder="如某某科技" />
+        </label>
+        <label>岗位链接（可选）
+          <input id="manualUrl" type="url" placeholder="https://..." />
+        </label>
+      </div>
+      <label class="block">岗位正文
+        <textarea id="manualBody" rows="12" placeholder="粘贴职位描述与任职要求"></textarea>
+      </label>
+      <div class="actions">
+        <button type="button" id="btnManualAnalyze" class="primary">精确分析</button>
+      </div>
+      <pre id="manualOut" class="log"></pre>
+    </section>
+
+    <section id="tab-apply" class="panel">
+      <p class="hint">达标岗位汇入此处。点击岗位名打开链接；匹配度点击查看分析。支持多选批量打开/删除。每页 30 条，最多 100 条。</p>
+      <div class="apply-threshold-row">
+        <label class="apply-threshold">入库阈值（≥该分且未排除）
+          <span class="inline-field">
+            <input id="applyListThreshold" type="number" min="0" max="100" />
+            <button type="button" id="btnApplySaveTh" class="secondary">保存阈值</button>
+          </span>
+        </label>
+      </div>
+      <div class="actions apply-actions">
+        <label class="checkbox-row"><input type="checkbox" id="applySelectAll" /> 全选本页</label>
+        <button type="button" id="btnApplyOpen" class="secondary">打开选中</button>
+        <button type="button" id="btnApplyDelete" class="secondary">删除选中</button>
+        <button type="button" id="btnApplyRefresh" class="link">刷新</button>
+      </div>
+      <div id="applyMeta" class="apply-meta">0 条</div>
+      <div class="apply-table-wrap">
+        <table class="apply-table" id="applyTable">
+          <thead>
+            <tr>
+              <th class="col-check"></th>
+              <th class="col-title">岗位</th>
+              <th class="col-company">公司</th>
+              <th class="col-score">匹配度</th>
+              <th class="col-source">来源</th>
+            </tr>
+          </thead>
+          <tbody id="applyBody"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button type="button" id="btnApplyPrev" class="link">上一页</button>
+        <span id="applyPageInfo">1 / 1</span>
+        <button type="button" id="btnApplyNext" class="link">下一页</button>
+      </div>
+      <dialog id="analysisDialog" class="analysis-dialog">
+        <form method="dialog" class="analysis-dialog-inner">
+          <h3 id="analysisDialogTitle">分析结果</h3>
+          <pre id="analysisDialogBody" class="log"></pre>
+          <button type="submit" class="primary">关闭</button>
+        </form>
+      </dialog>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" hidden role="status" aria-live="polite"></div>
+
+  <dialog id="pauseDialog" class="pause-dialog">
+    <div class="pause-dialog-inner">
+      <h3 id="pauseDialogTitle">已暂停</h3>
+      <p id="pauseDialogBody" class="hint">切走页面或出现验证码时会自动暂停。</p>
+      <div class="actions">
+        <button type="button" id="btnPauseDialogResume" class="primary">继续运行</button>
+        <button type="button" id="btnPauseDialogOk" class="secondary">知道了</button>
+      </div>
+    </div>
+  </dialog>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
