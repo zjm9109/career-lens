@@ -1682,13 +1682,18 @@ async function ensureUsageNoticeAccepted() {
     const cancel = $("btnUsageNoticeCancel");
     const check = $("usageNoticeCheck");
     if (check) check.checked = false;
+    const syncOk = () => {
+      if (ok) ok.disabled = !check?.checked;
+    };
+    syncOk();
     const cleanup = () => {
       ok?.removeEventListener("click", onOk);
       cancel?.removeEventListener("click", onCancel);
+      check?.removeEventListener("change", syncOk);
     };
     const onOk = async () => {
       if (!check?.checked) {
-        toast("请勾选「我已阅读并同意」", "error");
+        toast("请勾选确认已完整阅读并同意须知", "error");
         return;
       }
       await acceptUsageNotice();
@@ -1709,6 +1714,7 @@ async function ensureUsageNoticeAccepted() {
       }
       resolve(false);
     };
+    check?.addEventListener("change", syncOk);
     ok?.addEventListener("click", onOk);
     cancel?.addEventListener("click", onCancel);
     try {

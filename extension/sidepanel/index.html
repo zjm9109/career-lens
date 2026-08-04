@@ -274,25 +274,28 @@
   </dialog>
 
   <dialog id="usageNoticeDialog" class="pause-dialog usage-notice-dialog">
-    <div class="pause-dialog-inner">
-      <h3>使用须知</h3>
-      <div class="usage-notice-body hint">
-        <p>career-lens 仅供<strong>个人求职决策辅助</strong>，请遵守 Boss / 猎聘 / 智联等平台用户协议。</p>
-        <ul>
-          <li>禁止用于批量商业采数、转售数据或绕过平台限制。</li>
-          <li>不自动投递、不自动打招呼；不协助绕过验证码/风控。</li>
-          <li>无自建后端：画像与结果存本地；开启 AI 时摘要发往你自备的模型接口。</li>
-          <li>平台风控、账号限制与使用后果由使用者自行承担。</li>
-          <li>工具内的日风控/开详情限额为保护账号；请勿通过重装扩展故意规避。</li>
-        </ul>
+    <div class="pause-dialog-inner usage-notice-inner">
+      <p class="usage-notice-badge">重要声明 · 使用前必读</p>
+      <h3>使用须知与风险确认</h3>
+      <p class="usage-notice-lead">继续精筛即表示你已充分知悉并接受下列全部内容。若不同意，请点击「不同意」并停止使用。</p>
+      <div class="usage-notice-body">
+        <ol>
+          <li><strong>用途限制。</strong>本工具仅供自然人个人求职决策辅助。严禁批量采集、转售岗位数据，或用于商业爬取、竞品情报等。</li>
+          <li><strong>平台协议。</strong>你须遵守 Boss / 猎聘 / 智联等第三方用户协议与适用法律。验证码、限流、封号等后果由你自行承担。</li>
+          <li><strong>行为边界。</strong>本工具不自动投递、不自动打招呼，不协助绕过验证码或风控。禁止利用本工具对抗平台安全机制。</li>
+          <li><strong>数据与隐私。</strong>无自建后端，数据默认存于本地。若配置大模型 API Key，摘要将发往你所选服务商，请自行评估其条款。</li>
+          <li><strong>免责。</strong>分析结果仅供参考，不构成录用承诺或法律意见。因使用或滥用产生的损失，作者在法律允许范围内不承担责任。</li>
+          <li><strong>保护性限额。</strong>日风控次数、开详情上限等限制用于降低账号风险。请勿通过清数据或重装扩展故意规避。</li>
+        </ol>
+        <p class="usage-notice-foot">完整条款见项目 README「使用须知与风险」。表述不一致时，以较严格者为准。</p>
       </div>
       <label class="checkbox-row usage-notice-check">
         <input type="checkbox" id="usageNoticeCheck" />
-        我已阅读并同意以上须知
+        <span>我已<strong>完整阅读</strong>上述须知与风险，理解账号与合规后果由本人承担，并同意遵守全部条款。</span>
       </label>
-      <div class="actions">
-        <button type="button" id="btnUsageNoticeOk" class="primary">同意并继续</button>
-        <button type="button" id="btnUsageNoticeCancel" class="secondary">取消</button>
+      <div class="actions usage-notice-actions">
+        <button type="button" id="btnUsageNoticeOk" class="primary" disabled>同意并开始精筛</button>
+        <button type="button" id="btnUsageNoticeCancel" class="secondary">不同意</button>
       </div>
     </div>
   </dialog>

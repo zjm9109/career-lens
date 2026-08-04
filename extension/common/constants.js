@@ -57,8 +57,8 @@ export const DEFAULT_SETTINGS = {
 export const APPLY_LIST_MAX = 100;
 export const APPLY_LIST_PAGE_SIZE = 30;
 
-/** 使用须知版本；升高后需用户重新勾选 */
-export const USAGE_NOTICE_VERSION = 1;
+/** 使用须知版本；升高后须重新勾选同意 */
+export const USAGE_NOTICE_VERSION = 2;
 /** 当日平台风控（短信/行为异常等）达到此次数 → 软锁精筛 */
 export const DAILY_RISK_LOCK_COUNT = 3;
 /** 猎聘单日最多真正打开详情次数（跨域/避雷跳过不计） */

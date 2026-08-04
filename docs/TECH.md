@@ -63,7 +63,7 @@ career-lens/
             状态不可信（llmRequired 却无分析正文等）→ 强制待复核
 AI：按 effectiveFitScore(fitTotal) ≥ 分析阈值
 收藏：仅「建议投递」且达收藏阈值
-投递列表：effectiveFitScore ≥ 入库阈值；可导出 CSV
+投递列表：effectiveFitScore ≥ 入库阈值；可导出 xlsx
 暂停：系统暂停约 10s 探测自动恢复；手动暂停需点继续
 ```
 
