@@ -60,6 +60,7 @@
     // UI 操作区噪声（若被拼进正文）
     s = s.replace(/收藏\s*立即沟通\s*举报[\s\S]{0,40}不合适/g, "\n");
     s = s.replace(/微信扫码分享/g, "");
+    s = s.replace(/数据加载失败|点击重新加载/g, " ");
     // 截断页脚 / 侧栏推荐（否则「广告销售招聘」会误触避雷「销售」）
     const cutMarks = [
       "求职工具",
@@ -78,7 +79,8 @@
       const i = s.indexOf(m);
       if (i >= 0 && (cutAt < 0 || i < cutAt)) cutAt = i;
     }
-    if (cutAt > 80) s = s.slice(0, cutAt);
+    // 失败页正文极短时「求职工具」也在前 80 字内，必须裁掉
+    if (cutAt >= 0) s = s.slice(0, cutAt);
     // 若仍含「岗位职责/任职」，尽量从该处起取
     const startMarks = ["职位描述", "岗位职责", "岗位描述", "任职要求", "任职资格", "工作职责"];
     let start = -1;
@@ -310,6 +312,25 @@
     )].slice(0, 24);
   }
 
+  /** 详情区是否加载失败 / 刮到页脚 SEO 云（不可打分） */
+  function isBrokenDetailText(raw) {
+    const s = String(raw || "");
+    if (/数据加载失败|点击重新加载|网络不给力|网络异常|加载失败/.test(s)) return true;
+    if (/热门职位/.test(s) && /热门城市|热门企业/.test(s)) return true;
+    if (/求职工具\s*VIP|VIP已开通/.test(s) && !/任职要求|岗位职责|工作职责|职位描述/.test(s)) {
+      return true;
+    }
+    if ((s.match(/[\u4e00-\u9fffA-Za-z]{2,16}招聘/g) || []).length >= 6) return true;
+    return false;
+  }
+
+  function looksLikeJobBody(s) {
+    const t = String(s || "");
+    if (!t || t.length < 40 || isBrokenDetailText(t)) return false;
+    if (/任职要求|任职资格|岗位职责|工作职责|职位描述|岗位描述|职位介绍/.test(t)) return true;
+    return t.length >= 80 && /负责|熟悉|经验|要求|优先|本科|硕士|项目|交付|管理/.test(t);
+  }
+
   function scrapeDetail() {
     const root = detailRoot();
     const listActive =
@@ -349,9 +370,18 @@
     const keywords = scrapeKeywords(root);
 
     const descEl = descriptionRoot(root);
+    const rawProbe = [
+      root ? visibleText(root).slice(0, 4000) : "",
+      descEl ? visibleText(descEl).slice(0, 4000) : ""
+    ].join("\n");
+    const loadFailed = isBrokenDetailText(rawProbe);
+
     let description = cleanJobText(visibleText(descEl));
-    if (description.length < 40 && root) {
+    if (description.length < 40 && root && !loadFailed) {
       description = cleanJobText(visibleText(root));
+    }
+    if (loadFailed || isBrokenDetailText(description) || !looksLikeJobBody(description)) {
+      description = "";
     }
 
     const favBtn = findFavoriteButton(root || document);
@@ -367,6 +397,8 @@
       url = jobUrlFromId(jobId) || fromList?.url || "";
     }
 
+    const ready = !loadFailed && looksLikeJobBody(description);
+
     return {
       title: String(title || "").replace(/收藏|立即沟通|举报/g, "").trim(),
       listTitle: fromList?.title || "",
@@ -377,6 +409,8 @@
       url,
       jobId,
       favorited,
+      loadFailed,
+      ready,
       rawLength: description.length
     };
   }
@@ -426,11 +460,15 @@
     clickable.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
 
     const start = Date.now();
-    while (Date.now() - start < 8000) {
+    while (Date.now() - start < 10000) {
       await sleep(350);
       const now = scrapeDetail();
+      if (now.loadFailed) {
+        // 明确失败页：继续等到超时，勿把页脚当 JD
+        continue;
+      }
       const titleChanged = now.title && before.title && now.title !== before.title;
-      const descReady = now.rawLength > 60;
+      const descReady = now.ready && now.rawLength > 60;
       if ((titleChanged || index === 0 || now.jobId) && descReady) {
         return {
           ok: true,
@@ -439,16 +477,30 @@
         };
       }
     }
-    const detail = mergeCard(scrapeDetail(), card);
+    const last = scrapeDetail();
+    if (last.loadFailed || isBrokenDetailText(visibleText(detailRoot()))) {
+      return {
+        ok: false,
+        detail: mergeCard({ ...last, description: "", rawLength: 0, ready: false, loadFailed: true }, card),
+        listCount: items.length,
+        reason: "详情数据加载失败，请刷新后重试"
+      };
+    }
+    const detail = mergeCard(last, card);
     return {
-      ok: detail.rawLength > 40 || !!detail.title,
+      ok: false,
       detail,
       listCount: items.length,
-      reason: detail.rawLength > 40 ? "" : "详情加载超时，已回退列表字段"
+      reason: detail.ready && detail.rawLength > 40 ? "" : "详情加载超时或正文不可用，请刷新后重试"
     };
   }
 
   function mergeCard(detail, card) {
+    // 失败/空详情不要用列表摘要冒充 JD 去打高分
+    const desc =
+      detail.loadFailed || detail.ready === false
+        ? detail.description || ""
+        : detail.description || card.listText || "";
     return {
       ...detail,
       title: detail.title || card.title,
@@ -457,7 +509,9 @@
       url: (!detail.url || isSearchUrl(detail.url) ? card.url : detail.url) || card.url,
       jobId: detail.jobId || card.jobId,
       keywords: detail.keywords?.length ? detail.keywords : [],
-      description: detail.description || card.listText || ""
+      description: desc,
+      loadFailed: !!detail.loadFailed,
+      ready: !!detail.ready && !!desc
     };
   }
 
@@ -482,9 +536,18 @@
   }
 
   function detectBlocker() {
-    const body = visibleText(document.body).slice(0, 2000);
-    if (/验证码|滑动验证|异常访问|人机验证|请完成验证/.test(body)) {
+    const body = visibleText(document.body).slice(0, 2500);
+    const detailText = visibleText(detailRoot()).slice(0, 2500);
+    const probe = `${detailText}\n${body}`;
+    if (/验证码|滑动验证|异常访问|人机验证|请完成验证/.test(probe)) {
       return { blocked: true, reason: "检测到验证码或安全校验" };
+    }
+    if (
+      /数据加载失败|点击重新加载|网络异常|网络不给力|加载失败|请刷新|出错了|系统繁忙|服务异常|请求失败/.test(
+        probe
+      )
+    ) {
+      return { blocked: true, reason: "检测到页面网络/加载异常，请刷新后等待自动继续" };
     }
     return { blocked: false };
   }

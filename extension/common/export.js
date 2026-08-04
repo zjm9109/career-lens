@@ -5,6 +5,7 @@ import {
   enrichResult,
   estimateDeepseekCost,
   groupResultsByRecommendation,
+  isRecommendationUnreliable,
   splitAnalysisLine
 } from "./recommend.js";
 
@@ -36,11 +37,14 @@ export function sortResults(results) {
   });
 }
 
-function statusLine(score, recommendation) {
+function statusLine(score, recommendation, result) {
   if (score.excluded || recommendation === REC.EXCLUDE) {
     return `已排除（规则分 ${score.total ?? 0}% 仅供参考，因避雷未进入模型/收藏）`;
   }
   if (recommendation === REC.REVIEW) {
+    if (result && isRecommendationUnreliable(result)) {
+      return `待复核 · 推荐状态不可信（无可用模型结论，规则分 ${score.total ?? 0}% 仅供参考）`;
+    }
     const fit = score.fitTotal != null ? `，契合原分 ${score.fitTotal}%` : "";
     const gate =
       score.gateStatus === "fail"
@@ -98,7 +102,7 @@ function pushJobMarkdown(lines, r, idx, mode) {
   lines.push(`- 公司：${esc(job.company || "-")}`);
   if (salary) lines.push(`- 薪资：${esc(salary)}`);
   lines.push(`- 链接：${esc(job.url || "-")}`);
-  lines.push(`- 结果：${statusLine(score, rec)}`);
+  lines.push(`- 结果：${statusLine(score, rec, r)}`);
   lines.push(`- 匹配度：${score.total ?? 0}%`);
   if (score.fitTotal != null && score.fitTotal !== score.total) {
     lines.push(`- 契合原分：${score.fitTotal}%`);
@@ -111,7 +115,13 @@ function pushJobMarkdown(lines, r, idx, mode) {
           : "")
     );
   }
-  if (rec === REC.REVIEW) lines.push(`- 防漏：待复核（请人工确认）`);
+  if (rec === REC.REVIEW) {
+    lines.push(
+      isRecommendationUnreliable(r)
+        ? `- 防漏：待复核（模型结论不可用，请人工确认，勿信规则虚高分）`
+        : `- 防漏：待复核（请人工确认）`
+    );
+  }
   if (score.gateStatus === "fail") {
     lines.push(
       `- 门禁：硬门槛未过` +
@@ -125,6 +135,9 @@ function pushJobMarkdown(lines, r, idx, mode) {
   if (score.avoidHits?.length) lines.push(`- 避雷命中：${score.avoidHits.join("、")}`);
   if (score.attentionHits?.length) lines.push(`- 注意项：${score.attentionHits.join("、")}`);
   if (score.hardGaps?.length) lines.push(`- 硬门槛缺口：${score.hardGaps.join("；")}`);
+  if (score.softGaps?.length) {
+    lines.push(`- 软缺口（不挡建议）：${esc(score.softGaps.slice(0, 8).join("；"))}`);
+  }
   const req = score.requirements || {};
   if (req.must?.length) lines.push(`- 必备能力：${esc(req.must.slice(0, 16).join("、"))}`);
   if (req.mustMiss?.length) lines.push(`- 必备未满足：${esc(req.mustMiss.slice(0, 12).join("、"))}`);
@@ -250,12 +263,18 @@ export function resultsToPlainParagraphs(results, { mode = "simple", deepseekCal
       paras.push(`公司：${job.company || "-"}`);
       if (salary) paras.push(`薪资：${salary}`);
       paras.push(`链接：${job.url || "-"}`);
-      paras.push(`结果：${statusLine(score, rec)}`);
+      paras.push(`结果：${statusLine(score, rec, r)}`);
       paras.push(`匹配度：${score.total ?? 0}%`);
       if (score.fitTotal != null && score.fitTotal !== score.total) {
         paras.push(`契合原分：${score.fitTotal}%`);
       }
-      if (rec === REC.REVIEW) paras.push(`防漏：待复核（请人工确认）`);
+      if (rec === REC.REVIEW) {
+        paras.push(
+          isRecommendationUnreliable(r)
+            ? `防漏：待复核（模型结论不可用，请人工确认，勿信规则虚高分）`
+            : `防漏：待复核（请人工确认）`
+        );
+      }
       if (score.gateStatus === "fail") {
         paras.push(
           `门禁：硬门槛未过` +
@@ -555,76 +574,226 @@ function applySourceLabel(row) {
   return "";
 }
 
-/** 投递列表 → UTF-8 BOM CSV（Excel 可直接打开） */
-export function applyListToCsv(rows) {
-  const headers = [
-    "岗位名称",
-    "公司",
-    "链接",
-    "展示匹配度",
-    "契合原分",
-    "建议分组",
-    "是否待复核",
-    "门禁状态",
-    "门禁失败项",
-    "硬门槛缺口",
-    "必备未满足",
-    "注意项",
-    "来源",
-    "是否打开过",
-    "打开状态",
-    "入列时间",
-    "最近更新时间",
-    "分析摘要"
+const APPLY_LIST_HEADERS = [
+  "岗位名称",
+  "公司",
+  "链接",
+  "展示匹配度",
+  "契合原分",
+  "建议分组",
+  "是否待复核",
+  "门禁状态",
+  "门禁失败项",
+  "硬门槛缺口",
+  "必备未满足",
+  "注意项",
+  "来源",
+  "是否打开过",
+  "打开状态",
+  "入列时间",
+  "最近更新时间",
+  "分析摘要"
+];
+
+/** 匹配度 ↓ → 契合度 ↓ → 入列时间 ↓ */
+export function compareApplyListRows(a, b) {
+  const matchA = Number(a?.total) || 0;
+  const matchB = Number(b?.total) || 0;
+  if (matchB !== matchA) return matchB - matchA;
+  const fitA = Number(a?.fitTotal ?? a?.effectiveScore) || 0;
+  const fitB = Number(b?.fitTotal ?? b?.effectiveScore) || 0;
+  if (fitB !== fitA) return fitB - fitA;
+  return (Number(b?.createdAt) || 0) - (Number(a?.createdAt) || 0);
+}
+
+function applyListRowCells(row) {
+  const opened = row.applyStatus === "已打开" ? "是" : "否";
+  const gateLabel =
+    row.gateStatus === "fail"
+      ? "硬门槛未过"
+      : row.gateStatus === "pass"
+        ? "硬门槛通过"
+        : row.gateLabel || "";
+  const analysis = compactAnalysis(row.analysis || "").slice(0, 500).replace(/\n+/g, "；");
+  const review =
+    row.reviewFlag || row.recommendation === REC.REVIEW ? "是" : "否";
+  return [
+    { t: "s", v: row.title || "" },
+    { t: "s", v: row.company || "" },
+    { t: "s", v: row.url || "" },
+    { t: "n", v: Number(row.total) || 0 },
+    { t: "n", v: Number(row.fitTotal ?? row.effectiveScore) || 0 },
+    { t: "s", v: row.recommendation || "" },
+    { t: "s", v: review },
+    { t: "s", v: gateLabel },
+    { t: "s", v: (row.gateFailed || []).join("；") },
+    { t: "s", v: (row.hardGaps || []).join("；") },
+    { t: "s", v: (row.mustMiss || []).join("；") },
+    { t: "s", v: (row.attentionHits || []).join("；") },
+    { t: "s", v: applySourceLabel(row) },
+    { t: "s", v: opened },
+    { t: "s", v: row.applyStatus || "未打开" },
+    { t: "s", v: formatLocalTime(row.createdAt) },
+    { t: "s", v: formatLocalTime(row.updatedAt) },
+    { t: "s", v: analysis }
   ];
-  const lines = [headers.map(csvEscape).join(",")];
-  const sorted = [...(rows || [])].sort((a, b) => {
-    const sa = a.effectiveScore ?? a.fitTotal ?? a.total ?? 0;
-    const sb = b.effectiveScore ?? b.fitTotal ?? b.total ?? 0;
-    if (sb !== sa) return sb - sa;
-    return (b.createdAt || 0) - (a.createdAt || 0);
-  });
+}
+
+/** 投递列表 → UTF-8 BOM CSV（兼容保留） */
+export function applyListToCsv(rows) {
+  const lines = [APPLY_LIST_HEADERS.map(csvEscape).join(",")];
+  const sorted = [...(rows || [])].sort(compareApplyListRows);
   for (const row of sorted) {
-    const opened = row.applyStatus === "已打开" ? "是" : "否";
-    const gateLabel =
-      row.gateStatus === "fail"
-        ? "硬门槛未过"
-        : row.gateStatus === "pass"
-          ? "硬门槛通过"
-          : row.gateLabel || "";
-    const analysis = compactAnalysis(row.analysis || "").slice(0, 500).replace(/\n+/g, "；");
     lines.push(
-      [
-        row.title || "",
-        row.company || "",
-        row.url || "",
-        row.total ?? "",
-        row.fitTotal ?? row.effectiveScore ?? "",
-        row.recommendation || "",
-        row.reviewFlag || row.recommendation === REC.REVIEW ? "是" : "否",
-        gateLabel,
-        (row.gateFailed || []).join("；"),
-        (row.hardGaps || []).join("；"),
-        (row.mustMiss || []).join("；"),
-        (row.attentionHits || []).join("；"),
-        applySourceLabel(row),
-        opened,
-        row.applyStatus || "未打开",
-        formatLocalTime(row.createdAt),
-        formatLocalTime(row.updatedAt),
-        analysis
-      ]
-        .map(csvEscape)
+      applyListRowCells(row)
+        .map((c) => csvEscape(c.v))
         .join(",")
     );
   }
   return `\uFEFF${lines.join("\r\n")}`;
 }
 
+function colLetter(index0) {
+  let n = index0 + 1;
+  let s = "";
+  while (n > 0) {
+    const r = (n - 1) % 26;
+    s = String.fromCharCode(65 + r) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+/** 按内容估算列宽（Excel 字符宽），并限制上下界 */
+function estimateColWidths(headerRow, dataRows) {
+  const cols = headerRow.length;
+  const widths = headerRow.map((h) => Math.max(4, String(h).length + 2));
+  for (const row of dataRows) {
+    for (let i = 0; i < cols; i++) {
+      const raw = row[i]?.v;
+      const s = raw == null ? "" : String(raw);
+      // 中文略宽：按字符数估算，长链接/摘要封顶
+      const len = Math.min(60, [...s].length + (i === 2 || i === 17 ? 0 : 1));
+      widths[i] = Math.max(widths[i], Math.min(48, Math.max(6, len)));
+    }
+  }
+  // 链接、分析摘要给更宽默认
+  widths[2] = Math.max(widths[2], 28);
+  widths[17] = Math.max(widths[17], 36);
+  return widths.map((w) => Math.min(56, Math.max(8, w)));
+}
+
+function xlsxInlineCell(ref, cell, styleId) {
+  const sAttr = styleId != null ? ` s="${styleId}"` : "";
+  if (cell.t === "n" && Number.isFinite(Number(cell.v))) {
+    return `<c r="${ref}"${sAttr}><v>${Number(cell.v)}</v></c>`;
+  }
+  const t = escXml(String(cell.v ?? "")).replace(/\r\n|\r|\n/g, "&#10;");
+  return `<c r="${ref}"${sAttr} t="inlineStr"><is><t xml:space="preserve">${t}</t></is></c>`;
+}
+
+/** 极简 XLSX：冻结首行 + 列宽按内容估算 + 已排序数据 */
+export function applyListToXlsxBlob(rows) {
+  const sorted = [...(rows || [])].sort(compareApplyListRows);
+  const headerCells = APPLY_LIST_HEADERS.map((h) => ({ t: "s", v: h }));
+  const data = sorted.map(applyListRowCells);
+  const widths = estimateColWidths(APPLY_LIST_HEADERS, data);
+  const colXml = widths
+    .map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`)
+    .join("");
+
+  const sheetRows = [];
+  const allRows = [headerCells, ...data];
+  allRows.forEach((cells, rIdx) => {
+    const r = rIdx + 1;
+    const headerStyle = r === 1 ? 1 : null;
+    const cs = cells
+      .map((cell, cIdx) => xlsxInlineCell(`${colLetter(cIdx)}${r}`, cell, headerStyle))
+      .join("");
+    sheetRows.push(`<row r="${r}">${cs}</row>`);
+  });
+
+  const lastCol = colLetter(APPLY_LIST_HEADERS.length - 1);
+  const dim = `A1:${lastCol}${Math.max(1, allRows.length)}`;
+
+  const sheet1 = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetViews>
+    <sheetView tabSelected="1" workbookViewId="0">
+      <pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>
+      <selection pane="bottomLeft" activeCell="A2" sqref="A2"/>
+    </sheetView>
+  </sheetViews>
+  <dimension ref="${dim}"/>
+  <cols>${colXml}</cols>
+  <sheetData>
+    ${sheetRows.join("\n    ")}
+  </sheetData>
+  <autoFilter ref="${dim}"/>
+</worksheet>`;
+
+  const styles = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="2">
+    <font><sz val="11"/><name val="Calibri"/></font>
+    <font><b/><sz val="11"/><name val="Calibri"/></font>
+  </fonts>
+  <fills count="2">
+    <fill><patternFill patternType="none"/></fill>
+    <fill><patternFill patternType="gray125"/></fill>
+  </fills>
+  <borders count="1"><border/></borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="2">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+    <xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>
+  </cellXfs>
+</styleSheet>`;
+
+  const workbook = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="投递列表" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>`;
+
+  const rootRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>`;
+
+  const wbRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>`;
+
+  const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>`;
+
+  const zip = zipStore({
+    "[Content_Types].xml": contentTypes,
+    "_rels/.rels": rootRels,
+    "xl/workbook.xml": workbook,
+    "xl/_rels/workbook.xml.rels": wbRels,
+    "xl/worksheets/sheet1.xml": sheet1,
+    "xl/styles.xml": styles
+  });
+
+  return new Blob([zip], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+  });
+}
+
 export async function downloadApplyListExcel(rows) {
-  const filename = makeFilename("career-lens-投递列表", "csv");
-  const csv = applyListToCsv(rows);
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const filename = makeFilename("career-lens-投递列表", "xlsx");
+  const blob = applyListToXlsxBlob(rows);
   await downloadBlob(blob, filename);
   return { filename, count: (rows || []).length };
 }

@@ -41,7 +41,7 @@ export const DEFAULT_SETTINGS = {
   favoriteThreshold: 80,
   /** 进入投递列表的最低规则分，默认跟收藏阈值 */
   applyListThreshold: null,
-  batchSize: 10,
+  batchSize: 5,
   exportMode: "simple",
   exportFormat: "md",
   /** 已废弃：始终不拦截 */
@@ -56,6 +56,13 @@ export const DEFAULT_SETTINGS = {
 
 export const APPLY_LIST_MAX = 100;
 export const APPLY_LIST_PAGE_SIZE = 30;
+
+/** 使用须知版本；升高后需用户重新勾选 */
+export const USAGE_NOTICE_VERSION = 1;
+/** 当日平台风控（短信/行为异常等）达到此次数 → 软锁精筛 */
+export const DAILY_RISK_LOCK_COUNT = 3;
+/** 猎聘单日最多真正打开详情次数（跨域/避雷跳过不计） */
+export const DAILY_LIEPIN_DETAIL_OPEN_MAX = 25;
 
 export const DEFAULT_PROFILE = {
   skills: [],

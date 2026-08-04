@@ -31,9 +31,9 @@ export const REC = {
   EXCLUDE: "已排除"
 };
 
-/** 待复核：门禁压分 / 规则分偏低时的契合原分门槛 */
-export const REVIEW_FIT_HIGH = 70;
-export const REVIEW_FIT_DIR = 65;
+/** 待复核：门禁压分 / 规则分偏低时的契合原分门槛（略降以覆盖域压分后的近邻岗） */
+export const REVIEW_FIT_HIGH = 60;
+export const REVIEW_FIT_DIR = 55;
 
 /** 入库/分析用有效分：优先契合原分，避免门禁封顶导致漏召回 */
 export function effectiveFitScore(score) {
@@ -41,6 +41,19 @@ export function effectiveFitScore(score) {
   const fit = Number(score.fitTotal);
   if (Number.isFinite(fit)) return fit;
   return Number(score.total) || 0;
+}
+
+/** 待复核用分：域压分前与压分后取高，避免领域压到 15 后永远进不了待复核 */
+export function reviewFitScore(score) {
+  if (!score) return 0;
+  const a = Number(score.fitBeforeDomainCrush);
+  const b = Number(score.fitTotal);
+  const c = Number(score.total) || 0;
+  return Math.max(
+    Number.isFinite(a) ? a : 0,
+    Number.isFinite(b) ? b : 0,
+    c
+  );
 }
 
 function directionTitleHit(job, profile) {
@@ -55,11 +68,25 @@ function directionTitleHit(job, profile) {
  */
 export function needsHumanReview(score, job, profile) {
   if (!score || score.excluded) return false;
-  const fit = effectiveFitScore(score);
+  const fit = reviewFitScore(score);
   const total = Number(score.total) || 0;
 
   if (score.gateStatus === "fail") {
-    return fit >= REVIEW_FIT_HIGH;
+    // 跨域但角色/能力仍像：进待复核，避免全挤在「谨慎」
+    if (fit >= REVIEW_FIT_HIGH) return true;
+    const role = Number(score.pillars?.role?.score);
+    const cap = Number(score.pillars?.capability?.score);
+    const domainFail = (score.gateFailed || []).some((x) => /领域|行业/.test(String(x)));
+    if (
+      Number.isFinite(role) &&
+      Number.isFinite(cap) &&
+      role >= 75 &&
+      cap >= 60 &&
+      (fit >= REVIEW_FIT_DIR || (domainFail && role >= 80 && cap >= 65))
+    ) {
+      return true;
+    }
+    return false;
   }
 
   // 门禁通过：展示分偏低 + 契合原分仍高（或方向贴且略放宽）
@@ -195,9 +222,49 @@ export function parseAdviceFromAnalysis(analysis) {
   return "";
 }
 
+/** 主动跳过模型（非「状态不可信」） */
+export function isLlmIntentionallySkipped(skipped) {
+  return /避雷命中|避雷：|低于分析阈值|低于阈值|未配置/.test(String(skipped || ""));
+}
+
+/** 模型调用失败痕迹（任意错误，不限 503） */
+export function isLlmCallFailed(skipped) {
+  const s = String(skipped || "");
+  if (!s || isLlmIntentionallySkipped(s)) return false;
+  return /失败|请求失败|\b5\d\d\b|\b429\b|busy|unavailable|too busy|Failed to fetch|超时|timeout|返回空|负载|error|Error|拒绝|unauthorized|401|403/i.test(
+    s
+  );
+}
+
+/**
+ * 推荐状态是否不可信：已配置并应走模型，但没有可用分析正文。
+ * （含 503/网络/空响应/语义降级后的规则虚高，不限于某一错误码）
+ */
+export function isRecommendationUnreliable(result) {
+  const score = result?.score || {};
+  if (score.excluded) return false;
+  if (String(result?.analysis || "").trim()) return false;
+  if (isLlmIntentionallySkipped(result?.skippedDeepseek)) return false;
+
+  if (result?.llmRequired === true) return true;
+  if (score.semanticDegraded) return true;
+  if (isLlmCallFailed(result?.skippedDeepseek)) return true;
+  // 有 Key 路径留下的纯规则高分：四维标注 rule 且展示分偏高，无模型正文
+  if (
+    score.scoreMode === "rule" &&
+    (score.total ?? 0) >= 60 &&
+    result?.llmRequired !== false &&
+    (result?.hasLlmKey === true || result?.llmLabel)
+  ) {
+    return true;
+  }
+  return false;
+}
+
 /**
  * 分组顺序：建议投递 → 待复核 → 谨慎投递 → 已排除
  * 门禁 FAIL 且高契合 → 待复核（不得「建议投递」）；低契合门禁失败 → 谨慎
+ * 状态不可信（无可靠模型结论）→ 待复核，禁止规则满分直接「建议投递」
  */
 export function getRecommendation(result) {
   const score = result?.score || {};
@@ -205,21 +272,35 @@ export function getRecommendation(result) {
 
   if (needsHumanReview(score, result?.job, result?.profile)) return REC.REVIEW;
 
+  if (isRecommendationUnreliable(result)) {
+    return REC.REVIEW;
+  }
+
   if (score.gateStatus === "fail") return REC.CAUTION;
 
   // JD 过空/套话：即使标签命中也不「建议投递」
   if (score.jdConcrete?.sparse) return REC.CAUTION;
 
+  const analysisOk = !!String(result?.analysis || "").trim();
   const advice = parseAdviceFromAnalysis(result?.analysis);
   if (advice === "不建议" || advice === "谨慎") return REC.CAUTION;
 
-  const hardGaps = score.hardGaps || [];
+  // 仅硬缺口挡建议；软能力缺口（信息化近义未写字面等）不挡
+  const hardGaps = (score.hardGaps || []).filter(
+    (g) =>
+      /证书|语言|年限|领域语义|硬性领域|工作语言|JD具体度偏低/.test(g) ||
+      (/必备能力：/.test(g) && !/信息化|数字化|国企|央企|瀑布|敏捷|成本管控|实施交付|跨部门/.test(g))
+  );
   if (hardGaps.length) return REC.CAUTION;
 
   const total = score.total ?? 0;
   if (total < 60) return REC.CAUTION;
 
   if (advice === "建议") return REC.SUGGEST;
+
+  // 已配置 Key 且本应分析：必须有模型正文才允许按分数「建议」；无 Key 纯规则模式除外
+  if (result?.llmRequired === true && !analysisOk) return REC.REVIEW;
+
   if (total >= 60) return REC.SUGGEST;
   return REC.CAUTION;
 }

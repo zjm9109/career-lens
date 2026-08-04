@@ -53,13 +53,18 @@ career-lens/
 
 ```
 简历 → 标签 + 规则侧写（必）/ AI 侧写（可选）→ 保存画像
-岗位 → scoreJobFull：
+岗位 → 详情质量检查（失败页/页脚噪声 → 暂停重试，不打分）
+     → scoreJobFull：
          1) scoreJob 规则四维（无 Key 兜底）+ 硬门槛
          2) 有 Key → semantic-score（向量或 LLM）合并四维；域语义低 → 门禁 FAIL
-         3) getRecommendation：避雷 / 待复核 / 建议 / 谨慎
+            语义失败 → semanticDegraded，沿用规则分
+         3) 有 Key 且 ≥ 分析阈值 → LLM 解读（chatCompletion 含瞬时重试）
+         4) getRecommendation：避雷 / 待复核 / 建议 / 谨慎
+            状态不可信（llmRequired 却无分析正文等）→ 强制待复核
 AI：按 effectiveFitScore(fitTotal) ≥ 分析阈值
 收藏：仅「建议投递」且达收藏阈值
 投递列表：effectiveFitScore ≥ 入库阈值；可导出 CSV
+暂停：系统暂停约 10s 探测自动恢复；手动暂停需点继续
 ```
 
 | Key | 内容 |
@@ -80,8 +85,13 @@ AI：按 effectiveFitScore(fitTotal) ≥ 分析阈值
 | 侧写文案与结构 | `common/profile-report.js` |
 | 契合四维定义/权重 | `common/pillars.js` |
 | 语义/向量打分 | `common/semantic-score.js` |
-| 导出 MD/Word / 投递 CSV | `common/export.js` |
-| 侧栏编排 | `sidepanel/app.js` |
+| 建议/待复核/状态可信度 | `common/recommend.js`（`isRecommendationUnreliable`） |
+| LLM 重试 / 瞬时错误 | `common/llm.js`（`chatCompletion` / `isTransientLlmError`） |
+| 失败详情 / 页脚噪声识别 | `common/job-sections.js`（`isUnusableJobDescription`）；`platforms/boss/content.js` |
+| 标题跨域跳过开详情 | `common/title-domain-skip.js` |
+| 日风控/开详情软锁、须知 | `common/storage.js`（`cl_safety`）+ `constants.js` 限额常量 |
+| 导出 MD/Word / 投递 xlsx | `common/export.js` |
+| 侧栏编排、暂停自动恢复、人味节奏 | `sidepanel/app.js`（`humanizeBrowse` / `afterDetailOpenPacing`） |
 
 ---
 
@@ -103,7 +113,8 @@ JD具体度偏低 → 缩放/封顶；稀疏 JD 不得「建议投递」
   福利 chips 不进 must
 ```
 
-待复核：`REVIEW_FIT_HIGH=70`（`recommend.js`）。
+待复核门槛：`REVIEW_FIT_HIGH=60`、`REVIEW_FIT_DIR=55`（`recommend.js`）。  
+推荐可信度：有 Key 且 `llmRequired` 时，无 `analysis` 正文 → `isRecommendationUnreliable` → 待复核。
 
 ### 自测门禁（仓库根目录）
 
@@ -147,7 +158,27 @@ console.log({ total:s.total, fitTotal:s.fitTotal, gate:s.gateStatus, failed:s.ga
 - 猎聘约 15–20 条/页，靠页码翻页，不是无限下拉。  
 - 连开后台 `/job/` 详情过快易触发 `safe.liepin.com`「账号行为异常」短信验证。  
 - 侧栏对猎聘：条间隔约 8–14s、每 8 条休息约 45s；详情页若进风控则立即暂停。  
-- 建议本批≤8；触发后先完成短信验证再「继续/续跑」。
+- 建议本批≤8；触发后先完成短信验证再「继续/续跑」（系统暂停约 10s 会自动探测恢复）。
+
+### 暂停自动恢复
+
+| 类型 | 行为 |
+|------|------|
+| 系统暂停 | 验证码 / 网络异常 / 切页 / 详情加载失败 → `notifyPaused({ autoResume: true })`，`waitWhilePaused` 约每 10s `probePlatformReady` |
+| 手动暂停 | `autoResume: false`，必须点「继续运行」 |
+| 探测就绪 | `CL_PING` + 无 blocker + 列表可读 |
+
+### 详情质量（Boss）
+
+- `isBrokenDetailText` / `isUnusableJobDescription`：失败文案、VIP 条、热门职位云、≥6 个「xx招聘」  
+- `openListItem` 须 `ready` 且非 `loadFailed`；失败时 `ok:false`，侧栏抛瞬时错误走暂停重试  
+- `cleanJobText` / `stripNoise`：页脚标记（求职工具/热门职位…）**一律裁切**（含正文极短的失败页）
+
+### LLM 瞬时重试与推荐降级
+
+- `chatCompletion`：503/429/busy/`Failed to fetch` 等 → 退避 3s/8s/15s，最多 3 次  
+- 仍失败或语义 `semanticDegraded` 且无分析正文 → `getRecommendation` → **待复核**（禁止规则满分「建议投递」）  
+- 结果字段：`llmRequired`、`hasLlmKey`、`skippedDeepseek`、`score.semanticDegraded`
 
 ---
 
@@ -160,15 +191,18 @@ console.log({ total:s.total, fitTotal:s.fitTotal, gate:s.gateStatus, failed:s.ga
 
 若日志出现 `Resource::kQuotaBytes quota exceeded`：已做压缩仍满时，点「从头」或扩展页清除本扩展数据。
 
+系统暂停（验证码 / 网络异常 / 切页 / 失败详情）后约每 10 秒探测列表是否可读并自动继续；手动暂停需点「继续运行」。
+
 ---
 
 ## 待办（Roadmap）
 
 完整说明见 [CHANGELOG.md](./CHANGELOG.md)。当前优先：
 
-1. **评测集固化**（热力建造师、压裂英语、AI 漫剧、汽车悬架 PM、空岗套话、或选句、PM 隐含）  
+1. **评测集固化**（热力建造师、压裂英语、AI 漫剧、汽车悬架 PM、空岗套话、失败详情、模型忙线）  
 2. **语义缓存 / 本地 embedding**，降成本与 Key 依赖  
 3. **猎聘稳态**：可配间隔、翻页游标、风控后续跑体验  
 4. **断言证据链 UI**：JD↔简历逐条对照  
 5. **稀疏 JD / 中性维**再收紧；**UNKNOWN** 严/松可配  
 6. 侧写版本号；职业包保持轻量（展示 + 无 Key 兜底）  
+

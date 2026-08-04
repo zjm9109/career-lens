@@ -150,7 +150,27 @@ const PM_ROUTINE_TERMS = [
   "任务分配",
   "资源协调",
   "跨部门协调",
-  "跨部门沟通"
+  "跨部门沟通",
+  "成本管控",
+  "成本控制",
+  "预算管控",
+  "实施交付",
+  "项目交付",
+  "交付管理"
+];
+
+/** 有 PM 背景时，方法论视为可覆盖（不因简历未写「瀑布」扣硬缺口） */
+const PM_METHODOLOGY_TERMS = ["瀑布", "瀑布式", "敏捷", "Scrum", "Kanban", "混合研发", "混合管理"];
+
+/** 近义/上位：简历写央企/数字化等可覆盖「信息化」「国企」 */
+const TERM_SYNONYM_GROUPS = [
+  ["信息化", "数字化", "信息系统", "信息科技", "系统交付", "软件交付", "IT交付", "IT项目"],
+  ["国企", "央企", "国有企业", "中央企业", "国央企"],
+  ["实施交付", "项目交付", "交付管理", "落地交付", "交付经理"],
+  ["成本管控", "成本控制", "预算管控", "成本管理", "造价管控"],
+  ["人工智能", "AI", "大模型", "AIGC", "机器学习"],
+  ["瀑布", "瀑布式", "传统交付", "阶段门"],
+  ["敏捷", "Scrum", "迭代交付"]
 ];
 
 const PM_BACKGROUND_RE =
@@ -167,11 +187,53 @@ function hasPmBackground(profile) {
 }
 
 function isPmRoutineTerm(term) {
-  const t = String(term || "").trim();
+  const t = String(term || "").trim().replace(/（.*?）/g, "");
   if (!t) return false;
   if (PM_ROUTINE_TERMS.some((x) => x === t || wideHit(t, x) || wideHit(x, t))) return true;
-  // 未枚举全的近义：含「归档/复盘/评审会/纪要」且偏过程、非行业专有
+  if (PM_METHODOLOGY_TERMS.some((x) => x === t || wideHit(t, x) || wideHit(x, t))) return true;
   return /^(?:项目|阶段|里程碑|交付|资料|文档|过程)?.{0,6}(?:归档|复盘|评审会|例会|纪要|周报|月报)$/.test(t);
+}
+
+function profileBagBag(profile) {
+  return [
+    ...(profile.skills || []),
+    ...(profile.industries || []),
+    ...(profile.directions || []),
+    ...(profile.certificates || []),
+    ...(profile.languages || []),
+    profile.resumeText || ""
+  ].join("\n");
+}
+
+function synonymCovers(profile, term) {
+  const t = String(term || "").trim().replace(/（.*?）/g, "");
+  if (!t) return false;
+  const bag = profileBagBag(profile);
+  for (const group of TERM_SYNONYM_GROUPS) {
+    const inGroup = group.some((g) => g === t || wideHit(t, g) || wideHit(g, t));
+    if (!inGroup) continue;
+    if (group.some((g) => textMentionsTerm(bag, g) || userMatches(profile.skills, g) || userMatches(profile.industries, g) || userMatches(profile.directions, g))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** 软素质/过程缺口：可展示，但不进 hardGaps、不挡「建议投递」 */
+function isSoftCapabilityMiss(label) {
+  const t = String(label || "").trim();
+  if (!t) return true;
+  if (/英语|英文|日语|六级|四级|证书|建造师|PMP|工作语言/.test(t)) return false;
+  if (/领域语义|硬性领域|JD具体度/.test(t)) return false;
+  // 垃圾或选句
+  if (/（至少一种）/.test(t) && (t.length > 28 || /秩序|辅导|缺少明确|情况下|并推动/.test(t))) {
+    return true;
+  }
+  if (isPmRoutineTerm(t)) return true;
+  if (/信息化|数字化|国企|央企|瀑布|敏捷|Scrum|成本管控|实施交付|跨部门|进度跟踪|任务拆解/.test(t)) {
+    return true;
+  }
+  return false;
 }
 
 function splitClauses(text) {
@@ -196,30 +258,36 @@ function isHardSignalClause(clause) {
   );
 }
 
+const OR_TOOL_HINT =
+  /^(ERP|OA|CRM|SAP|MES|WMS|PLM|HR|Java|Python|SQL|Go|C\+\+|PCS|BMS|EMS|DevOps|K8s|Kubernetes|Docker)$/i;
+
 /**
  * 「精通 ERP、OA、CRM 等至少一种」——整句是或选，命中任一即满足该需求单元。
+ * 软素质长句（秩序/辅导/缺少流程）不走或选。
  */
 function isOrChoiceClause(clause) {
   const c = String(clause || "");
-  if (/至少一[种种项个]|任[一选]|其中一[种种项]|任意一[种种项]|之一即可|之一|熟悉其中|掌握其中|精通其中|会其中/.test(c)) {
+  if (/秩序|辅导|缺少明确|情况下|抗压|责任心|沟通能力|团队精神/.test(c)) return false;
+  if (/至少一[种种项个]|任选其一|其中一[种种项]|任意一[种种项]|之一即可/.test(c)) {
     return true;
   }
-  // 精通/熟悉 A或B（或C）；或 A/B/C
+  // 精通/熟悉 短工具列表：A/B/C 或 A或B
   if (
-    /(?:精通|熟悉|掌握|了解|具备|使用过|用过|熟练)/.test(c) &&
-    (/[A-Za-z\u4e00-\u9fff]{1,12}(?:\s*[\/]\s*[A-Za-z\u4e00-\u9fff]{1,12}){1,8}/.test(c) ||
-      /[A-Za-z\u4e00-\u9fff]{1,12}\s*或\s*[A-Za-z\u4e00-\u9fff]{1,12}/.test(c))
+    /(?:精通|熟悉|掌握|了解|熟练使用|使用过)/.test(c) &&
+    (/[A-Za-z][A-Za-z0-9+]{1,15}(?:\s*[\/、]\s*[A-Za-z][A-Za-z0-9+]{1,15}){1,8}/.test(c) ||
+      /(?:ERP|OA|CRM|SAP|Java|Python|SQL)[^。]{0,40}(?:或|、|\/)/.test(c) ||
+      /[A-Za-z\u4e00-\u9fff]{2,8}\s*或\s*[A-Za-z\u4e00-\u9fff]{2,8}/.test(c))
   ) {
     return true;
   }
   return false;
 }
 
-/** 从或选句抽出候选工具/技能词 */
+/** 从或选句抽出短工具/技能词；拒收软句碎片 */
 function extractOrAlternatives(clause, vocab = []) {
   const c = String(clause || "");
   const m = c.match(
-    /(?:精通|熟悉|掌握|了解|具备|使用过|用过|熟练使用)([^。；;\n]{2,100})/
+    /(?:精通|熟悉|掌握|了解|具备|使用过|用过|熟练使用)([^。；;\n]{2,80})/
   );
   let chunk = m ? m[1] : c;
   chunk = chunk
@@ -231,24 +299,35 @@ function extractOrAlternatives(clause, vocab = []) {
     .split(/[、，,/]|或/)
     .map((s) => {
       let x = s.replace(/^(?:如|例如|包括)\s*/g, "").trim();
-      // Python开发 → Python；OA系统 → OA（短词保留）
       const stripped = x.replace(/(?:开发|编程|语言|系统|软件|平台|工具)$/u, "");
       if (stripped.length >= 2 && stripped.length < x.length) {
-        if ((vocab || []).some((v) => wideHit(v, stripped) || v === stripped) || /^(ERP|OA|CRM|SAP|MES|WMS|PLM|Java|Python|SQL|Go|C\+\+)$/i.test(stripped)) {
+        if (
+          (vocab || []).some((v) => wideHit(v, stripped) || v === stripped) ||
+          OR_TOOL_HINT.test(stripped)
+        ) {
           x = stripped;
         }
       }
       return x;
     })
     .filter((s) => {
-      if (!s || s.length < 2 || s.length > 16) return false;
-      if (/至少|优先|经验|能力|要求|相关|等等|一种|一项|即可/.test(s)) return false;
+      if (!s || s.length < 2 || s.length > 12) return false;
+      if (/至少|优先|经验|能力|要求|相关|等等|一种|一项|即可|情况|秩序|辅导|缺少|推动|落地|流程/.test(s)) {
+        return false;
+      }
       if (GENERIC_CAPABILITY.test(s)) return false;
-      return /[A-Za-z\u4e00-\u9fff]/.test(s);
+      // 必须像工具/技能：英文缩写、词表命中、或短中文专名
+      if (OR_TOOL_HINT.test(s)) return true;
+      if ((vocab || []).some((v) => v === s || wideHit(v, s))) return true;
+      if (/^[A-Za-z][A-Za-z0-9+]{1,15}$/.test(s)) return true;
+      if (/^[\u4e00-\u9fff]{2,8}$/.test(s) && !/的|与|及|和|在|为|能|将/.test(s)) return true;
+      return false;
     });
 
-  const fromVocab = (vocab || []).filter((t) => c.includes(t) || wideHit(c, t));
-  return pruneSubterms([...new Set([...parts, ...fromVocab])]).slice(0, 10);
+  const fromVocab = (vocab || []).filter(
+    (t) => t.length <= 12 && (c.includes(t) || wideHit(c, t)) && !/项目经理|项目管理/.test(t)
+  );
+  return pruneSubterms([...new Set([...parts, ...fromVocab])]).slice(0, 8);
 }
 
 function formatOrGroupLabel(terms) {
@@ -436,11 +515,14 @@ export function buildRequirementInventory(job, profile) {
   for (const clause of splitClauses(job.responsibilities || "")) absorbClause(clause, "must");
   for (const clause of splitClauses(job.bonus || "")) absorbClause(clause, "bonus");
 
-  // 独立必备 = 未并入或选组的 must 词
+  // 独立必备 = 未并入或选组的 must 词；或选标签去重
+  const seenUnitLabels = new Set(mustUnits.map((u) => u.label));
   for (const t of [...must]) {
     if (orTermSet.has(t)) continue;
     if (mustUnits.some((u) => u.terms.includes(t))) continue;
+    if (seenUnitLabels.has(t)) continue;
     mustUnits.push({ mode: "all", terms: [t], label: t });
+    seenUnitLabels.add(t);
   }
 
   const mustArr = pruneSubterms([...must]);
@@ -450,18 +532,20 @@ export function buildRequirementInventory(job, profile) {
   const pmBg = hasPmBackground(profile);
 
   const matchBag = (term) => {
+    const bare = String(term || "").replace(/（.*?）/g, "").trim();
     if (
-      userMatches(profile.skills, term) ||
-      userMatches(profile.industries, term) ||
-      userMatches(profile.directions, term) ||
-      userMatches(profile.certificates, term) ||
-      userMatches(profile.languages, term) ||
-      textMentionsTerm(profile.resumeText || "", term)
+      userMatches(profile.skills, bare) ||
+      userMatches(profile.industries, bare) ||
+      userMatches(profile.directions, bare) ||
+      userMatches(profile.certificates, bare) ||
+      userMatches(profile.languages, bare) ||
+      textMentionsTerm(profile.resumeText || "", bare)
     ) {
       return true;
     }
-    // 有 PM 背景时，常见过程动作视为隐含覆盖
-    if (pmBg && isPmRoutineTerm(term)) return true;
+    if (synonymCovers(profile, bare)) return true;
+    // 有 PM 背景时，过程动作 + 方法论视为隐含覆盖
+    if (pmBg && isPmRoutineTerm(bare)) return true;
     return false;
   };
 
@@ -998,14 +1082,28 @@ export function scoreJob(job, profile, settings) {
   const avoidHits = collectAvoidHits(job, profile);
   const attentionHits = collectAttentionHits(job, profile);
   const hardGaps = collectHardGaps(job, profile);
-  for (const m of (requirements.mustMiss || []).slice(0, 12)) {
-    if (/英语|英文|日语|六级|四级/.test(m)) hardGaps.push(`必备语言：${m}`);
-    else hardGaps.push(`必备能力：${m}`);
+  const softGaps = [];
+  for (const m of (requirements.mustMiss || []).slice(0, 16)) {
+    if (/英语|英文|日语|六级|四级/.test(m)) {
+      hardGaps.push(`必备语言：${m}`);
+      continue;
+    }
+    if (isSoftCapabilityMiss(m)) {
+      softGaps.push(`能力缺口（软）：${m}`);
+      continue;
+    }
+    hardGaps.push(`必备能力：${m}`);
   }
-  if (concrete.sparse || concrete.thin) {
-    hardGaps.push(`JD具体度偏低（${concrete.score}）：${(concrete.reasons || []).slice(0, 2).join("；") || "要求偏空泛"}`);
+  // 仅极端空岗进硬缺口挡建议；thin 只作软提示
+  if (concrete.sparse) {
+    hardGaps.push(
+      `JD具体度偏低（${concrete.score}）：${(concrete.reasons || []).slice(0, 2).join("；") || "要求偏空泛"}`
+    );
+  } else if (concrete.thin) {
+    softGaps.push(`JD具体度偏低（${concrete.score}）`);
   }
   const uniqGaps = [...new Set(hardGaps)];
+  const uniqSoft = [...new Set(softGaps)];
   const excluded = avoidHits.length > 0;
 
   // 四维：规则映射为兜底；有 Key 时由 mergeSemanticIntoScore 覆盖
@@ -1030,6 +1128,7 @@ export function scoreJob(job, profile, settings) {
     avoidHits,
     attentionHits,
     hardGaps: uniqGaps,
+    softGaps: uniqSoft,
     requirements,
     jdConcrete: concrete,
     pillars,
@@ -1042,7 +1141,49 @@ export function scoreJob(job, profile, settings) {
   const pack = getDefaultPack();
   // 同步阶段：职业包域词仅作兜底；有语义结果时 mergeSemanticIntoScore 会替换域门禁
   const gates = evaluateGates(job, profile, pack, { skipPackDomain: false });
-  return applyGateToScore(base, gates);
+  return pruneDomainDuplicateMisses(applyGateToScore(base, gates));
+}
+
+/** 域门禁已说明跨域时，去掉「必备：汽车」等同行业重复缺口 */
+function pruneDomainDuplicateMisses(score) {
+  if (!score || score.gateStatus !== "fail") return score;
+  const domainBlob = [...(score.gateFailed || []), score.semantic?.jobDomain || ""].join(" ");
+  if (!/领域|行业/.test(domainBlob) && !score.semantic?.jobDomain) return score;
+
+  const industryLike = (t) =>
+    KNOWN_INDUSTRIES.some((i) => t === i || t.includes(i) || i.includes(t)) ||
+    /汽车|电力|制造|土建|施工|石油|矿业|储能|弱电|印刷|风电|主机厂/.test(t);
+
+  const keepMiss = (raw) => {
+    const core = String(raw)
+      .replace(/（.*?）/g, "")
+      .replace(/^必备能力：/, "")
+      .trim();
+    if (!industryLike(core)) return true;
+    if (domainBlob.includes(core)) return false;
+    if (
+      KNOWN_INDUSTRIES.some((i) => domainBlob.includes(i) && (core.includes(i) || i.includes(core)))
+    ) {
+      return false;
+    }
+    if (
+      /汽车|电力|制造|土建|施工|石油|矿业|储能|弱电|印刷|风电/.test(core) &&
+      /领域语义不符|硬性领域/.test(domainBlob)
+    ) {
+      return false;
+    }
+    return true;
+  };
+
+  const req = score.requirements || {};
+  return {
+    ...score,
+    hardGaps: (score.hardGaps || []).filter(keepMiss),
+    requirements: {
+      ...req,
+      mustMiss: (req.mustMiss || []).filter(keepMiss)
+    }
+  };
 }
 
 /**
@@ -1116,5 +1257,5 @@ export function mergeSemanticIntoScore(score, semantic, settings) {
     }
   };
 
-  return applyGateToScore(next, gates);
+  return pruneDomainDuplicateMisses(applyGateToScore(next, gates));
 }

@@ -442,6 +442,9 @@
     if (/验证码|滑动验证|异常访问|人机验证|请完成验证/.test(body)) {
       return { blocked: true, reason: "检测到验证码或安全校验" };
     }
+    if (/网络异常|网络不给力|加载失败|请刷新|出错了|系统繁忙|服务异常|请求失败/.test(body)) {
+      return { blocked: true, reason: "检测到页面网络/加载异常，请刷新后等待自动继续" };
+    }
     return { blocked: false };
   }
 

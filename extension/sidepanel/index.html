@@ -25,7 +25,7 @@
 
   <main>
     <section id="tab-run" class="panel active">
-      <p class="hint">打开招聘列表筛选后开始。同一列表未改筛时，再次开始会从上次位置接着往后跑。列表变了或点「从头」才从第 1 条重来。中途中断用「续跑」。猎聘有分页且风控较严：建议本批≤8，出现「账号行为异常」先短信验证再继续。</p>
+      <p class="hint">打开招聘列表筛选后开始。同一列表未改筛时会接着往后跑。标题明显跨域（芯片/电力/医院等）或列表避雷会跳过开详情。猎聘风控严：建议本批≤5；今日风控≥3 次或开详情达上限将暂停至明天。首次使用须同意使用须知。</p>
       <div class="row">
         <label>本批条数
           <select id="batchSize"></select>
@@ -214,7 +214,7 @@
     </section>
 
     <section id="tab-apply" class="panel">
-      <p class="hint">达标岗位汇入此处（按契合原分判断，含待复核防漏岗）。点击岗位名打开链接；匹配度点击查看分析。支持多选批量打开/删除。每页 30 条，最多 100 条。「导出 Excel」为 CSV，可用 Excel 直接打开。</p>
+      <p class="hint">达标岗位汇入此处（按契合原分≥入库阈值且未排除）。列表「建议·匹配」合并显示建议分组与匹配度/契合原分；导出同序：匹配度 → 契合原分 → 入列时间。最多 100 条；满员替换最低分且入列最久的一条。点击岗位名打开链接；点建议·匹配查看分析。支持多选打开/删除。「导出 Excel」为 xlsx（冻结表头、列宽自适应）。</p>
       <div class="apply-threshold-row">
         <label class="apply-threshold">入库阈值（≥该契合原分且未排除）
           <span class="inline-field">
@@ -227,7 +227,7 @@
         <label class="checkbox-row"><input type="checkbox" id="applySelectAll" /> 全选本页</label>
         <button type="button" id="btnApplyOpen" class="secondary">打开选中</button>
         <button type="button" id="btnApplyDelete" class="secondary">删除选中</button>
-        <button type="button" id="btnApplyExport" class="secondary" title="导出全部投递列表为 CSV（Excel 可打开）">导出 Excel</button>
+        <button type="button" id="btnApplyExport" class="secondary" title="导出全部投递列表为 xlsx（冻结表头、列宽自适应）">导出 Excel</button>
         <button type="button" id="btnApplyRefresh" class="link">刷新</button>
       </div>
       <div id="applyMeta" class="apply-meta">0 条</div>
@@ -238,7 +238,7 @@
               <th class="col-check"></th>
               <th class="col-title">岗位</th>
               <th class="col-company">公司</th>
-              <th class="col-score">匹配度</th>
+              <th class="col-rec-score" title="建议分组 · 展示匹配度 / 契合原分（入库按契合原分≥阈值）">建议·匹配</th>
               <th class="col-source">来源</th>
             </tr>
           </thead>
@@ -265,10 +265,34 @@
   <dialog id="pauseDialog" class="pause-dialog">
     <div class="pause-dialog-inner">
       <h3 id="pauseDialogTitle">已暂停</h3>
-      <p id="pauseDialogBody" class="hint">切走页面或出现验证码时会自动暂停。</p>
+      <p id="pauseDialogBody" class="hint">切走页面、验证码或网络异常时会自动暂停；系统暂停约每 10 秒检测恢复并自动继续。</p>
       <div class="actions">
         <button type="button" id="btnPauseDialogResume" class="primary">继续运行</button>
         <button type="button" id="btnPauseDialogOk" class="secondary">知道了</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="usageNoticeDialog" class="pause-dialog usage-notice-dialog">
+    <div class="pause-dialog-inner">
+      <h3>使用须知</h3>
+      <div class="usage-notice-body hint">
+        <p>career-lens 仅供<strong>个人求职决策辅助</strong>，请遵守 Boss / 猎聘 / 智联等平台用户协议。</p>
+        <ul>
+          <li>禁止用于批量商业采数、转售数据或绕过平台限制。</li>
+          <li>不自动投递、不自动打招呼；不协助绕过验证码/风控。</li>
+          <li>无自建后端：画像与结果存本地；开启 AI 时摘要发往你自备的模型接口。</li>
+          <li>平台风控、账号限制与使用后果由使用者自行承担。</li>
+          <li>工具内的日风控/开详情限额为保护账号；请勿通过重装扩展故意规避。</li>
+        </ul>
+      </div>
+      <label class="checkbox-row usage-notice-check">
+        <input type="checkbox" id="usageNoticeCheck" />
+        我已阅读并同意以上须知
+      </label>
+      <div class="actions">
+        <button type="button" id="btnUsageNoticeOk" class="primary">同意并继续</button>
+        <button type="button" id="btnUsageNoticeCancel" class="secondary">取消</button>
       </div>
     </div>
   </dialog>

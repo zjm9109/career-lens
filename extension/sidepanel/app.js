@@ -6,6 +6,8 @@ import {
   DEFAULT_WEIGHTS,
   DEFAULT_PILLAR_WEIGHTS,
   APPLY_LIST_PAGE_SIZE,
+  DAILY_RISK_LOCK_COUNT,
+  DAILY_LIEPIN_DETAIL_OPEN_MAX,
   normalizeWeights
 } from "../common/constants.js";
 import {
@@ -22,21 +24,33 @@ import {
   getApplyList,
   upsertApplyListItem,
   removeApplyListIds,
-  patchApplyListStatus
+  patchApplyListStatus,
+  isUsageNoticeAccepted,
+  acceptUsageNotice,
+  checkDailySafetyGate,
+  recordRiskEvent,
+  recordDetailOpen,
+  getSafetyState
 } from "../common/storage.js";
 import { scoreJob, mergeSemanticIntoScore } from "../common/scoring.js";
+import {
+  matchTitleDomainSkip,
+  buildTitleDomainExcludeScore
+} from "../common/title-domain-skip.js";
 import { scoreSemanticPillars } from "../common/semantic-score.js";
 import { analyzeJobWithLlm, LLM_PROVIDERS, resolveLlmConfig } from "../common/llm.js";
 import { PILLAR_LABELS } from "../common/pillars.js";
 import {
   downloadResults,
   downloadApplyListExcel,
+  compareApplyListRows,
   sortResults,
   formatDuration
 } from "../common/export.js";
 import { parseResumeFile, suggestProfileFromText } from "../common/resume-parse.js";
 import {
   compactAnalysis,
+  isUnusableJobDescription,
   normalizeSalary,
   parseJobSections,
   pickJobTitle
@@ -62,6 +76,9 @@ const $ = (id) => document.getElementById(id);
 const state = {
   running: false,
   paused: false,
+  /** 系统暂停（切页/验证码/网络）允许自动恢复；手动暂停不自动恢复 */
+  autoResumeAllowed: false,
+  pauseReason: "",
   stopFlag: false,
   /** 本批结果（侧栏展示 + 自动/手动导出） */
   results: [],
@@ -71,6 +88,11 @@ const state = {
   profileReport: null,
   processedInBatch: 0,
   sinceRest: 0,
+  /** 自上次「每5条轻抖」以来开详情数 */
+  sinceJitter5: 0,
+  /** 自上次人味操作以来开详情数；阈值每次随机 8–12 */
+  sinceHumanize: 0,
+  humanizeEvery: 10,
   deepseekCalls: 0,
   /** 本批内的模型调用次数（导出费用按本批计） */
   batchDeepseekCalls: 0,
@@ -269,9 +291,90 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function withTimeout(promise, ms, label = "操作") {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label}超时（${Math.round(ms / 1000)}s）`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/** 是否为可自动恢复的瞬时故障（网络/脚本未注入/超时） */
+function isTransientPlatformError(msg) {
+  return /网络|超时|timeout|Failed to fetch|Receiving end does not exist|Could not establish|连接|ERR_|net::|消息通道|Script|未注入|加载失败|请刷新|不给力|出错了|页面检查未通过|页脚噪声|正文不可用|正文未加载/i.test(
+    String(msg || "")
+  );
+}
+
+/** 猎聘短信/行为异常：列表页仍可读，不能靠「列表探测」自动继续，必须人工验证后点继续 */
+function requiresManualResume(reason) {
+  return /行为异常|短信验证|safe\.liepin|账号异常|异常访问行为|无法关闭.*详情|详情标签仍存在/i.test(
+    String(reason || "")
+  );
+}
+
+/**
+ * 探测招聘页是否已可继续：无风控、列表可读。
+ * 可见性：后台标签允许（用户可能在看侧栏）；仅当完全失联/无列表时判未就绪。
+ * 注意：猎聘详情风控时列表仍可读，不得据此自动恢复。
+ */
+async function probePlatformReady() {
+  try {
+    if (requiresManualResume(state.pauseReason)) {
+      return { ok: false, reason: "需完成短信验证并点「继续运行」" };
+    }
+    await withTimeout(sendToPlatform({ type: "CL_PING" }), 4000, "页面探测");
+    const blocker = await withTimeout(sendToPlatform({ type: "CL_BLOCKER" }), 4000, "风控探测");
+    if (blocker?.blocked) {
+      return { ok: false, reason: blocker.reason || "仍有安全校验" };
+    }
+    if (requiresManualResume(blocker?.reason)) {
+      return { ok: false, reason: blocker.reason };
+    }
+    const list = await withTimeout(sendToPlatform({ type: "CL_LIST" }), 5000, "列表探测");
+    if (!(list?.count > 0 || (list?.items || []).length > 0)) {
+      return { ok: false, reason: "列表尚未就绪" };
+    }
+    return { ok: true, count: list.count || list.items.length };
+  } catch (e) {
+    return { ok: false, reason: String(e.message || e) };
+  }
+}
+
+/**
+ * 等待暂停结束。允许自动恢复时每 ~10s 探测；短信/行为异常须手动继续。
+ */
 async function waitWhilePaused() {
+  const PROBE_EVERY_MS = 10000;
+  // 首次探测推迟一轮，避免风控刚报错时列表仍可读导致立刻误恢复
+  let lastProbe = Date.now();
   while (state.paused && !state.stopFlag) {
-    await sleep(200);
+    const now = Date.now();
+    const canAuto =
+      state.autoResumeAllowed && !requiresManualResume(state.pauseReason);
+    if (canAuto && now - lastProbe >= PROBE_EVERY_MS) {
+      lastProbe = now;
+      const probe = await probePlatformReady();
+      if (probe.ok) {
+        state.paused = false;
+        state.autoResumeAllowed = false;
+        state.pauseReason = "";
+        setPill("运行中", "busy");
+        $("btnResume").disabled = true;
+        dismissPauseDialog();
+        log(`页面已恢复（列表约 ${probe.count} 条），自动继续精筛`);
+        toast("已自动继续", "ok", 2500);
+        break;
+      }
+      const tip = probe.reason ? `（${probe.reason}）` : "";
+      log(`等待恢复中，约 10 秒后再检测${tip}`);
+      $("progress").textContent = `已暂停，自动检测恢复中…${tip}`;
+    } else if (!canAuto && state.paused) {
+      $("progress").textContent = requiresManualResume(state.pauseReason)
+        ? "已暂停：请完成短信/安全验证后点「继续运行」"
+        : "已暂停";
+    }
+    await sleep(400);
   }
 }
 
@@ -354,10 +457,16 @@ async function openDetailTab(url, platformId = "") {
   try {
     const t = await chrome.tabs.get(tab.id);
     if (isLiepinRiskUrl(t?.url || "")) {
+      const closed = await closeTabSafe(tab.id, { retries: platformId === "liepin" ? 4 : 1 });
+      if (platformId === "liepin" && !closed.ok) {
+        throw new Error(
+          `无法关闭猎聘详情页${closed.reason ? `（${closed.reason}）` : ""}，请手动关闭该标签后点「继续运行」`
+        );
+      }
       throw new Error("猎聘账号行为异常/短信验证，请先在浏览器完成验证后再继续");
     }
   } catch (e) {
-    if (/短信验证|行为异常|安全校验|验证码/.test(String(e.message || e))) throw e;
+    if (/短信验证|行为异常|安全校验|验证码|无法关闭/.test(String(e.message || e))) throw e;
   }
   return tab.id;
 }
@@ -401,29 +510,114 @@ async function scrapeDetailFromTab(tabId, contentScript, timeoutMs = 8000, opts 
   return res?.detail || {};
 }
 
-async function closeTabSafe(tabId) {
-  if (!tabId) return;
-  try {
-    await chrome.tabs.remove(tabId);
-  } catch {
-    /* 用户已关 */
+async function closeTabSafe(tabId, { retries = 1 } = {}) {
+  if (!tabId) return { ok: true, skipped: true };
+  let lastErr = "";
+  const attempts = Math.max(1, Number(retries) || 1);
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await chrome.tabs.remove(tabId);
+    } catch (e) {
+      lastErr = String(e?.message || e || "tabs.remove 失败");
+    }
+    await sleep(250 + i * 200);
+    try {
+      await chrome.tabs.get(tabId);
+      // 仍在：继续重试关闭
+      lastErr = lastErr || "详情标签仍存在";
+    } catch {
+      return { ok: true };
+    }
   }
+  return { ok: false, reason: lastErr || "无法关闭详情标签", tabId };
 }
 
 /**
  * 单条结束后补间隔，降低连开详情触发风控的概率。
- * 猎聘对后台连开 /job/ 很敏感：目标约 8–14s/条；Boss 仍为短补间隔。
+ * 猎聘：开过详情约 12–20s/条；仅列表跳过用短间隔。
  */
-async function paceAfterJob(t0, platformId = "") {
+async function paceAfterJob(t0, platformId = "", { light = false } = {}) {
   const elapsed = Date.now() - t0;
   if (platformId === "liepin") {
-    const minGap = randomBetween(8000, 14000);
+    const minGap = light ? randomBetween(1500, 3000) : randomBetween(12000, 20000);
     if (elapsed < minGap) await sleep(minGap - elapsed);
+    return;
+  }
+  if (light) {
+    await sleep(randomBetween(400, 1200));
     return;
   }
   if (elapsed < 3000) {
     await sleep(randomBetween(2000, 5000));
   }
+}
+
+/** 随机人味操作：滚动列表 / 停顿 / 再探列表（不投递、不多开详情） */
+async function humanizeBrowse(platformId = "") {
+  log(`模拟浏览停顿（${platformId || "平台"}）：轻微滚动/等待…`);
+  try {
+    await sendToPlatform({ type: "CL_SCROLL" });
+    await sleep(randomBetween(800, 2000));
+    if (Math.random() < 0.55) {
+      await sendToPlatform({ type: "CL_LIST" });
+    }
+    await sleep(randomBetween(1500, 4500));
+    if (Math.random() < 0.35) {
+      await sendToPlatform({ type: "CL_PING" });
+    }
+  } catch (e) {
+    log(`模拟浏览略过：${String(e.message || e).slice(0, 80)}`);
+  }
+}
+
+async function afterDetailOpenPacing(platformId) {
+  state.sinceJitter5 += 1;
+  state.sinceHumanize += 1;
+  // 每 5 次开详情：额外休息 1–3 秒
+  if (state.sinceJitter5 >= 5) {
+    const extra = randomBetween(1000, 3000);
+    log(`已开详情 5 条，额外休息 ${(extra / 1000).toFixed(1)}s…`);
+    await sleep(extra);
+    state.sinceJitter5 = 0;
+  }
+  // 每随机 8–12 次：人味操作
+  if (state.sinceHumanize >= state.humanizeEvery) {
+    await humanizeBrowse(platformId);
+    state.sinceHumanize = 0;
+    state.humanizeEvery = randomBetween(8, 12);
+    log(`下次模拟浏览约在再开 ${state.humanizeEvery} 条详情后`);
+  }
+}
+
+function buildListOnlyResult({
+  card,
+  listJob,
+  score,
+  skippedDeepseek,
+  profile,
+  platformId,
+  t0,
+  skipReason = ""
+}) {
+  const durationMs = Date.now() - t0;
+  const result = enrichResult({
+    order: ++state.order,
+    job: listJob,
+    score,
+    analysis: "",
+    skippedDeepseek,
+    llmRequired: false,
+    hasLlmKey: false,
+    favorited: false,
+    llmLabel: "",
+    durationMs,
+    platform: platformId,
+    source: "batch",
+    profile,
+    listOnly: true,
+    skipReason
+  });
+  return result;
 }
 
 async function refreshPlatformLabel() {
@@ -508,7 +702,7 @@ function fillWeightsUI(weights) {
   updateWeightSumHint();
 }
 
-/** 规则分 +（有 Key 时）语义/向量四维 */
+/** 规则分 +（有 Key 时）语义/向量四维；瞬时失败会随 chatCompletion 内重试 */
 async function scoreJobFull(job, profile, settings) {
   let score = scoreJob(job, profile, settings);
   if (settings.semanticFit === false) return score;
@@ -521,8 +715,20 @@ async function scoreJobFull(job, profile, settings) {
       log(
         `语义契合（${sem.mode}/${provider.label}）：角色${score.pillars?.role?.score} 领域${score.pillars?.domain?.score} 能力${score.pillars?.capability?.score} 资质${score.pillars?.qualify?.score}`
       );
+    } else {
+      score = {
+        ...score,
+        semanticDegraded: true,
+        semanticError: "语义接口无结果，已沿用规则四维"
+      };
+      log(`语义契合无结果，沿用规则四维（高分将进待复核，不直接建议投递）`);
     }
   } catch (e) {
+    score = {
+      ...score,
+      semanticDegraded: true,
+      semanticError: String(e.message || e)
+    };
     log(`语义契合失败，沿用规则四维：${e.message || e}`);
   }
   return score;
@@ -588,7 +794,7 @@ async function refreshContinueButton() {
     rs &&
     typeof rs.nextIndex === "number" &&
     typeof rs.processedInBatch === "number" &&
-    rs.processedInBatch < Math.min(100, Math.max(10, Number($("batchSize")?.value) || 10));
+    rs.processedInBatch < Math.min(100, Math.max(1, Number($("batchSize")?.value) || 5));
   // 中途停下且本批未满才显示续跑；本批已完成则用「接着筛选」
   const unfinished = can && rs.target != null && rs.nextIndex < (rs.target || Infinity);
   btn.disabled = !unfinished;
@@ -628,11 +834,13 @@ async function loadUI() {
 
   const sel = $("batchSize");
   sel.innerHTML = "";
-  for (let n = 10; n <= 100; n += 10) {
+  const batchOpts = [5, 8, 10, 15, 20, 30, 50, 80, 100];
+  const curBatch = Number(settings.batchSize) || 5;
+  for (const n of batchOpts) {
     const opt = document.createElement("option");
     opt.value = String(n);
     opt.textContent = String(n);
-    if (n === (settings.batchSize || 10)) opt.selected = true;
+    if (n === curBatch) opt.selected = true;
     sel.appendChild(opt);
   }
 
@@ -746,7 +954,7 @@ function collectSettingsFromUI(base) {
     deepseekThreshold: Number($("deepseekThreshold").value) || 0,
     favoriteThreshold: fav,
     applyListThreshold: applyTh,
-    batchSize: Number($("batchSize").value) || 10,
+    batchSize: Number($("batchSize").value) || 5,
     // 权重仅经「确认权重」写入；此处沿用已生效值，避免未确认草稿覆盖
     weights: normalizeWeights(base.weights || DEFAULT_PILLAR_WEIGHTS)
   };
@@ -838,20 +1046,32 @@ function renderResults() {
   updateDeepseekStats();
 }
 
-/** 暂停时弹框提醒（切页/验证码/手动暂停），避免只看日志漏掉 */
-function notifyPaused(reason, { autoResumeHint = true } = {}) {
+/** 暂停时弹框提醒（切页/验证码/网络/手动暂停），避免只看日志漏掉 */
+function notifyPaused(reason, { autoResumeHint = true, autoResume = true } = {}) {
+  state.paused = true;
+  const manual = requiresManualResume(reason) || !autoResume;
+  state.autoResumeAllowed = !manual;
+  state.pauseReason = reason || "";
   const dlg = $("pauseDialog");
   const body = $("pauseDialogBody");
   const msg =
     reason ||
     "精筛已暂停。请回到招聘列表页后点击「继续运行」。";
   if (body) {
-    body.textContent =
-      msg + (autoResumeHint ? "\n\n处理完验证码或切回列表后，点下方按钮继续。" : "");
+    let extra = "";
+    if (!manual && autoResumeHint) {
+      extra =
+        "\n\n将每约 10 秒自动检测页面是否恢复；网络异常请刷新列表页。也可点下方「继续运行」。";
+    } else if (autoResumeHint) {
+      extra = requiresManualResume(reason)
+        ? "\n\n猎聘「账号行为异常」时列表页仍可能正常，不会自动继续。请先在浏览器完成短信验证，再点「继续运行」。"
+        : "\n\n处理完后点下方「继续运行」。";
+    }
+    body.textContent = msg + extra;
   }
   setPill("已暂停", "pause");
   $("btnResume").disabled = false;
-  toast("已暂停 — 请查看弹窗", "error", 5000);
+  toast(manual ? "已暂停 — 请验证后点继续" : "已暂停 — 将自动检测恢复", "error", 5000);
   try {
     if (dlg && typeof dlg.showModal === "function" && !dlg.open) dlg.showModal();
   } catch {
@@ -869,8 +1089,8 @@ function notifyPaused(reason, { autoResumeHint = true } = {}) {
 }
 
 function dismissPauseDialog() {
-  const dlg = $("pauseDialog");
   try {
+    const dlg = $("pauseDialog");
     if (dlg?.open) dlg.close();
   } catch {
     /* ignore */
@@ -892,7 +1112,7 @@ async function maybeAddToApplyList(result, settings) {
     (r.source === "manual" ? "manual" : null) ||
     detectPlatformFromUrl(r.job?.url || "")?.id ||
     "boss";
-  await upsertApplyListItem(
+  const { evicted } = await upsertApplyListItem(
     {
       id: jobApplyId(r.job || {}),
       title: r.job?.title || "",
@@ -918,6 +1138,12 @@ async function maybeAddToApplyList(result, settings) {
     },
     th
   );
+  if (evicted?.title) {
+    log(
+      `投递列表已满 100，已替换最低分且入列最久：${evicted.title}` +
+        `（匹配${evicted.total ?? "-"} / 契合${evicted.fitTotal ?? evicted.effectiveScore ?? "-"}）`
+    );
+  }
 }
 
 async function checkpoint() {
@@ -970,15 +1196,34 @@ async function ensureListCount(need, have, platformId = "") {
   while (count < need && guard < 12) {
     await waitWhilePaused();
     if (state.stopFlag) break;
-    const blocker = await sendToPlatform({ type: "CL_BLOCKER" });
-    if (blocker.blocked) throw new Error(blocker.reason || "安全校验");
-    const vis = await sendToPlatform({ type: "CL_VISIBILITY" });
-    if (!vis.visible) {
-      state.paused = true;
-      log("页面不可见，已暂停。回到列表页后点「继续」");
-      notifyPaused("检测到招聘页不可见（可能切走了标签页），精筛已暂停。");
-      await waitWhilePaused();
-      dismissPauseDialog();
+    try {
+      const blocker = await sendToPlatform({ type: "CL_BLOCKER" });
+      if (blocker.blocked) {
+        const br = blocker.reason || "检测到安全校验或页面异常";
+        notifyPaused(br, { autoResume: !requiresManualResume(br) });
+        await waitWhilePaused();
+        dismissPauseDialog();
+        continue;
+      }
+      const vis = await sendToPlatform({ type: "CL_VISIBILITY" });
+      if (!vis.visible) {
+        log("页面不可见，已暂停。恢复后将自动继续");
+        notifyPaused("检测到招聘页不可见（可能切走了标签页），精筛已暂停。", {
+          autoResume: true
+        });
+        await waitWhilePaused();
+        dismissPauseDialog();
+      }
+    } catch (e) {
+      if (isTransientPlatformError(e.message || e)) {
+        notifyPaused(`列表补齐时异常：${String(e.message || e).slice(0, 80)}`, {
+          autoResume: true
+        });
+        await waitWhilePaused();
+        dismissPauseDialog();
+        continue;
+      }
+      throw e;
     }
 
     log(`列表不足，缓慢下拉补齐（当前 ${count}，目标 ${need}）…`);
@@ -1038,28 +1283,116 @@ async function processOneJob(index, profile, settings, platformId = "boss") {
   if (state.stopFlag) return null;
 
   try {
-    const blocker = await sendToPlatform({ type: "CL_BLOCKER" });
-    if (blocker.blocked) throw new Error(blocker.reason || "检测到验证，请处理后点继续");
+    const blocker = await withTimeout(sendToPlatform({ type: "CL_BLOCKER" }), 5000, "风控检测");
+    if (blocker.blocked) {
+      const br = blocker.reason || "检测到验证或页面异常";
+      notifyPaused(br, {
+        autoResume: !requiresManualResume(br)
+      });
+      await waitWhilePaused();
+      dismissPauseDialog();
+      if (state.stopFlag) return null;
+      const again = await withTimeout(sendToPlatform({ type: "CL_BLOCKER" }), 5000, "风控检测");
+      if (again.blocked) {
+        throw new Error(again.reason || "页面仍异常，稍后重试");
+      }
+    }
 
     const vis = await sendToPlatform({ type: "CL_VISIBILITY" });
     if (!vis.visible) {
-      state.paused = true;
       log("页面不可见，已暂停");
-      notifyPaused("检测到招聘页不可见（可能切走了标签页），精筛已暂停。");
+      notifyPaused("检测到招聘页不可见（可能切走了标签页），精筛已暂停。", {
+        autoResume: true
+      });
       await waitWhilePaused();
       dismissPauseDialog();
       if (state.stopFlag) return null;
     }
 
-    const list = await sendToPlatform({ type: "CL_LIST" });
+    const list = await withTimeout(sendToPlatform({ type: "CL_LIST" }), 8000, "读取列表");
     const card = list.items?.[index];
     if (!card) throw new Error(`无法读取列表第 ${index + 1} 条`);
 
+    // 通用预筛：标题强跨域 / 列表避雷 → 不开详情，直接出结果（降平台风控）
+    const listJob = normalizeJobRecord(
+      {
+        title: card.title,
+        company: card.company,
+        salary: card.salary,
+        url: card.url,
+        jobId: card.jobId,
+        keywords: card.keywords || [],
+        description: card.listText || card.title || "",
+        listTitle: card.title
+      },
+      card
+    );
+    const domainSkip = matchTitleDomainSkip(card.title || listJob.title, profile);
+    if (domainSkip.skip) {
+      const score = buildTitleDomainExcludeScore(domainSkip.term);
+      log(`#${index + 1} ${domainSkip.reason}：${card.title}`);
+      const result = buildListOnlyResult({
+        card,
+        listJob,
+        score,
+        skippedDeepseek: domainSkip.reason,
+        profile,
+        platformId,
+        t0,
+        skipReason: domainSkip.reason
+      });
+      log(
+        `#${index + 1} 建议：${result.recommendation} · 耗时 ${formatDuration(result.durationMs)}（未开详情）`
+      );
+      await maybeAddToApplyList(result, settings);
+      await paceAfterJob(t0, platformId, { light: true });
+      return result;
+    }
+    const preScore = scoreJob(listJob, profile, settings);
+    if (preScore.excluded) {
+      log(
+        `#${index + 1} 列表已命中避雷（${preScore.avoidHits.join("/")}），跳过开详情：${card.title}`
+      );
+      const result = buildListOnlyResult({
+        card,
+        listJob,
+        score: preScore,
+        skippedDeepseek: `避雷命中：${preScore.avoidHits.join("、")}`,
+        profile,
+        platformId,
+        t0,
+        skipReason: "避雷"
+      });
+      log(
+        `#${index + 1} 建议：${result.recommendation} · 耗时 ${formatDuration(result.durationMs)}（未开详情）`
+      );
+      await maybeAddToApplyList(result, settings);
+      await paceAfterJob(t0, platformId, { light: true });
+      return result;
+    }
+
+    // 开详情前再探风控 + 日限额
+    const dayGate = await checkDailySafetyGate(platformId);
+    if (!dayGate.ok) {
+      throw new Error(dayGate.reason || "今日安全限额已用尽");
+    }
+
     log(`#${index + 1} 打开详情：${card.title}`);
-    const opened = await sendToPlatform({ type: "CL_OPEN_INDEX", index });
+    const opened = await withTimeout(
+      sendToPlatform({ type: "CL_OPEN_INDEX", index }),
+      20000,
+      "打开详情"
+    );
     if (!opened.ok && !opened.detail && !opened.url) {
       throw new Error(opened.reason || "打开详情失败");
     }
+    if (
+      opened.detail?.loadFailed ||
+      /加载失败|正文不可用|页脚|请刷新/.test(String(opened.reason || ""))
+    ) {
+      throw new Error(opened.reason || "详情数据加载失败，请刷新后重试");
+    }
+    await recordDetailOpen(platformId);
 
     const { platform } = await getPlatformTab();
     let d = { ...(opened.detail || {}) };
@@ -1072,6 +1405,14 @@ async function processOneJob(index, profile, settings, platformId = "boss") {
         liepinStrict: platformId === "liepin"
       });
       if (scraped?.blocked || isLiepinRiskUrl(scraped?.url || "")) {
+        // 风控页也尽量关掉；关不掉则改为「无法关闭」暂停，避免标签堆积
+        try {
+          await closeDetailTabOrPause(detailTabId, platformId);
+          detailTabId = null;
+        } catch (closeErr) {
+          detailTabId = null;
+          throw closeErr;
+        }
         throw new Error(
           scraped?.blockReason || "猎聘账号行为异常/短信验证，请先在浏览器完成验证后再继续"
         );
@@ -1105,17 +1446,32 @@ async function processOneJob(index, profile, settings, platformId = "boss") {
         }
       }
     } else {
-      // Boss 等：CL_OPEN_INDEX 内已轮询就绪；正文不足时再短轮询
-      const needMore = !(d.description && (d.rawLength >= 60 || d.description.length >= 60));
+      // Boss 等：CL_OPEN_INDEX 内已轮询就绪；正文不足或失败页时再短轮询
+      const needMore =
+        d.loadFailed ||
+        !d.ready ||
+        !(d.description && (d.rawLength >= 60 || d.description.length >= 60));
       if (needMore) {
         const start = Date.now();
-        while (Date.now() - start < 2500) {
+        while (Date.now() - start < 4000) {
           const scraped = await sendToPlatform({ type: "CL_SCRAPE_DETAIL" });
           d = { ...d, ...(scraped.detail || {}) };
-          if ((d.rawLength || d.description?.length || 0) >= 60) break;
-          await sleep(250);
+          if (d.loadFailed) {
+            throw new Error("详情数据加载失败，请刷新后重试");
+          }
+          if (d.ready && (d.rawLength || d.description?.length || 0) >= 60) break;
+          await sleep(300);
         }
       }
+    }
+
+    // 失败页/页脚 SEO 不得入库打分（曾出现「数据加载失败+热门职位」仍建议投递）
+    const descCandidate =
+      d.loadFailed || isUnusableJobDescription(d.description || "")
+        ? ""
+        : d.description || (d.ready === false ? "" : card.listText || "");
+    if (d.loadFailed || isUnusableJobDescription(descCandidate)) {
+      throw new Error("详情正文未加载成功或为页脚噪声，请刷新后重试");
     }
 
     const job = normalizeJobRecord(
@@ -1131,11 +1487,15 @@ async function processOneJob(index, profile, settings, platformId = "boss") {
         jobId: d.jobId || card.jobId,
         salary: d.salary || card.salary,
         keywords: d.keywords?.length ? d.keywords : [],
-        description: d.description || card.listText || "",
+        description: descCandidate,
         listTitle: d.listTitle || card.title
       },
       card
     );
+
+    if (isUnusableJobDescription(job.description || job.responsibilities || "")) {
+      throw new Error("详情正文未加载成功或为页脚噪声，请刷新后重试");
+    }
 
     const score = await scoreJobFull(job, profile, settings);
     log(
@@ -1157,6 +1517,10 @@ async function processOneJob(index, profile, settings, platformId = "boss") {
     const { provider, apiKey } = resolveLlmConfig(settings);
 
     const fitForAi = effectiveFitScore(score);
+    /** 已配置 Key 且达到分析阈值：必须有模型正文，推荐状态才可信 */
+    const llmRequired =
+      !!apiKey && !score.excluded && fitForAi >= (settings.deepseekThreshold ?? 60);
+
     if (score.excluded) {
       skippedDeepseek = `避雷命中：${score.avoidHits.join("、")}`;
     } else if (fitForAi < (settings.deepseekThreshold ?? 60)) {
@@ -1181,12 +1545,21 @@ async function processOneJob(index, profile, settings, platformId = "boss") {
       } catch (e) {
         skippedDeepseek = `${provider.label} 失败：${e.message || e}`;
         log(skippedDeepseek);
+        log(`#${index + 1} 模型结论不可用，推荐改为待复核（不按不可信状态建议投递）`);
       }
     }
 
     // 收藏：仅「建议投递」路径；门禁失败 / 待复核 / 硬缺口不收藏
     const mustMissN = score.requirements?.mustMiss?.length || 0;
-    const preRec = enrichResult({ job, score, analysis, profile }).recommendation;
+    const preRec = enrichResult({
+      job,
+      score,
+      analysis,
+      skippedDeepseek,
+      llmRequired,
+      hasLlmKey: !!apiKey,
+      profile
+    }).recommendation;
     if (
       !opened.opensNewTab &&
       !score.excluded &&
@@ -1207,7 +1580,7 @@ async function processOneJob(index, profile, settings, platformId = "boss") {
       }
     }
 
-    await closeTabSafe(detailTabId);
+    await closeDetailTabOrPause(detailTabId, platformId);
     detailTabId = null;
 
     const durationMs = Date.now() - t0;
@@ -1217,6 +1590,8 @@ async function processOneJob(index, profile, settings, platformId = "boss") {
       score,
       analysis,
       skippedDeepseek,
+      llmRequired,
+      hasLlmKey: !!apiKey,
       favorited,
       llmLabel,
       durationMs,
@@ -1228,10 +1603,38 @@ async function processOneJob(index, profile, settings, platformId = "boss") {
     await maybeAddToApplyList(result, settings);
     // 条末补间隔（不计入上方耗时展示）；猎聘更长，防连开详情触发风控
     await paceAfterJob(t0, platformId);
+    await afterDetailOpenPacing(platformId);
     return result;
   } finally {
-    await closeTabSafe(detailTabId);
+    if (detailTabId) {
+      try {
+        await closeDetailTabOrPause(detailTabId, platformId);
+      } catch (e) {
+        // finally 内再抛会导致掩盖主错误；猎聘关不掉时记入暂停态，由外层下一轮感知
+        const msg = String(e.message || e);
+        if (platformId === "liepin" && requiresManualResume(msg)) {
+          log(`错误：${msg}`);
+          notifyPaused(msg, { autoResume: false });
+        }
+      }
+    }
   }
+}
+
+/** 关闭详情标签；猎聘关闭失败则抛错以触发暂停 */
+async function closeDetailTabOrPause(tabId, platformId = "") {
+  if (!tabId) return { ok: true, skipped: true };
+  const retries = platformId === "liepin" ? 4 : 1;
+  const closed = await closeTabSafe(tabId, { retries });
+  if (platformId === "liepin" && !closed.ok) {
+    throw new Error(
+      `无法关闭猎聘详情页${closed.reason ? `（${closed.reason}）` : ""}，请手动关闭该标签后点「继续运行」`
+    );
+  }
+  if (!closed.ok) {
+    log(`详情标签未能关闭：${closed.reason || tabId}`);
+  }
+  return closed;
 }
 
 async function finishBatch(settings, reason) {
@@ -1267,12 +1670,88 @@ async function finishBatch(settings, reason) {
   });
 }
 
+async function ensureUsageNoticeAccepted() {
+  if (await isUsageNoticeAccepted()) return true;
+  const dlg = $("usageNoticeDialog");
+  if (!dlg) {
+    toast("请先阅读并同意使用须知", "error");
+    return false;
+  }
+  return new Promise((resolve) => {
+    const ok = $("btnUsageNoticeOk");
+    const cancel = $("btnUsageNoticeCancel");
+    const check = $("usageNoticeCheck");
+    if (check) check.checked = false;
+    const cleanup = () => {
+      ok?.removeEventListener("click", onOk);
+      cancel?.removeEventListener("click", onCancel);
+    };
+    const onOk = async () => {
+      if (!check?.checked) {
+        toast("请勾选「我已阅读并同意」", "error");
+        return;
+      }
+      await acceptUsageNotice();
+      cleanup();
+      try {
+        dlg.close();
+      } catch {
+        /* ignore */
+      }
+      resolve(true);
+    };
+    const onCancel = () => {
+      cleanup();
+      try {
+        dlg.close();
+      } catch {
+        /* ignore */
+      }
+      resolve(false);
+    };
+    ok?.addEventListener("click", onOk);
+    cancel?.addEventListener("click", onCancel);
+    try {
+      if (typeof dlg.showModal === "function") dlg.showModal();
+      else dlg.setAttribute("open", "");
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
 async function runBatch({ resume = false } = {}) {
   const years = readYearsExperience();
   if (!years.ok) {
     toast(years.error, "error");
     return;
   }
+  if (!(await ensureUsageNoticeAccepted())) {
+    toast("需同意使用须知后才能精筛", "error");
+    return;
+  }
+  let platformIdHint = "";
+  try {
+    const { platform } = await getPlatformTab();
+    platformIdHint = platform?.id || "";
+  } catch {
+    /* 稍后健康检查再报 */
+  }
+  const dayGate = await checkDailySafetyGate(platformIdHint);
+  if (!dayGate.ok) {
+    log(dayGate.reason);
+    toast(dayGate.reason, "error", 6000);
+    notifyPaused(dayGate.reason, { autoResume: false, autoResumeHint: true });
+    return;
+  }
+  const safety = dayGate.safety || (await getSafetyState());
+  log(
+    `安全计数：今日风控 ${safety.dayCounters?.riskEvents || 0}/${DAILY_RISK_LOCK_COUNT}` +
+      (platformIdHint === "liepin"
+        ? ` · 猎聘开详情 ${safety.dayCounters?.liepinDetailOpens || 0}/${DAILY_LIEPIN_DETAIL_OPEN_MAX}`
+        : "")
+  );
+
   const profile = collectProfileFromUI();
   let settings = collectSettingsFromUI(await getSettings());
   await saveProfile(profile);
@@ -1282,8 +1761,11 @@ async function runBatch({ resume = false } = {}) {
   state.running = true;
   state.paused = false;
   state.stopFlag = false;
+  state.sinceJitter5 = 0;
+  state.sinceHumanize = 0;
+  state.humanizeEvery = randomBetween(8, 12);
 
-  const batchSize = Math.min(100, Math.max(10, settings.batchSize || 10));
+  const batchSize = Math.min(100, Math.max(1, settings.batchSize || 5));
 
   if (resume) {
     const rs = await getRunState();
@@ -1434,11 +1916,11 @@ async function runBatch({ resume = false } = {}) {
         continue;
       }
 
-      // 猎聘风控更严：每 8 条休息；其它平台大批次每 30 条
-      const restEvery = platformId === "liepin" ? 8 : 30;
-      const restSec = platformId === "liepin" ? 45 : 30;
+      // 猎聘风控更严：每 5 条（实际开过详情的）长休息；列表避雷跳过不计入
+      const restEvery = platformId === "liepin" ? 5 : 30;
+      const restSec = platformId === "liepin" ? 75 : 30;
       if (state.sinceRest >= restEvery && (platformId === "liepin" || batchGoal >= 50)) {
-        log(`已处理 ${restEvery} 条，强制休息 ${restSec} 秒（降风控）…`);
+        log(`已开详情 ${restEvery} 条，强制休息 ${restSec} 秒（降猎聘风控）…`);
         setPill("休息中", "pause");
         for (let s = restSec; s > 0; s--) {
           if (state.stopFlag) break;
@@ -1465,7 +1947,8 @@ async function runBatch({ resume = false } = {}) {
           state.results.push(item);
           state.sessionResults.push(item);
           state.processedInBatch += 1;
-          state.sinceRest += 1;
+          // 仅真实开过详情才累加休息计数（listOnly 避雷跳过不计）
+          if (!item.listOnly) state.sinceRest += 1;
           i += 1;
           state.nextIndex = i;
           state.target = Math.max(state.target, i);
@@ -1479,10 +1962,57 @@ async function runBatch({ resume = false } = {}) {
         const msg = String(e.message || e);
         log(`错误：${msg}`);
         await checkpoint();
-        if (/验证|安全校验|验证码|行为异常|短信验证/.test(msg)) {
-          state.paused = true;
+        if (
+          /行为异常|短信验证|safe\.liepin|异常访问行为|无法关闭.*详情|今日已触发平台风控|今日猎聘已打开详情/.test(
+            msg
+          )
+        ) {
+          if (/今日已触发|今日猎聘已打开/.test(msg)) {
+            notifyPaused(msg, { autoResume: false });
+            await waitWhilePaused();
+            dismissPauseDialog();
+            break;
+          }
+          const risk = await recordRiskEvent(
+            /无法关闭/.test(msg) ? "close-fail" : "platform-risk"
+          );
+          log(`已记录风控事件：今日 ${risk.riskEvents}/${DAILY_RISK_LOCK_COUNT}`);
           notifyPaused(
-            "检测到猎聘/平台安全校验（如「账号行为异常」短信验证）。请先在浏览器完成验证，再点「继续运行」或「续跑」。建议猎聘本批≤8 条、勿连开过多详情。"
+            risk.locked
+              ? `今日风控已达 ${risk.riskEvents} 次，精筛已锁定至明天。请休息账号，勿通过重装扩展规避。`
+              : /无法关闭/.test(msg)
+                ? msg
+                : "检测到账号行为异常/短信验证。请先在浏览器完成验证；完成后必须点「继续运行」。",
+            { autoResume: false }
+          );
+          await waitWhilePaused();
+          dismissPauseDialog();
+          if (state.stopFlag || risk.locked) break;
+          const coolSec = platformId === "liepin" ? 90 : 30;
+          log(`安全验证后冷却 ${coolSec} 秒再继续当前条…`);
+          setPill("冷却中", "pause");
+          for (let s = coolSec; s > 0; s--) {
+            if (state.stopFlag) break;
+            $("progress").textContent = `风控冷却 ${s}s`;
+            await sleep(1000);
+          }
+          state.sinceRest = 0;
+          setPill("运行中", "busy");
+          continue;
+        }
+        if (/验证|安全校验|验证码/.test(msg)) {
+          notifyPaused(
+            "检测到平台安全校验/验证码。请先在浏览器完成验证；页面恢复后将自动继续，也可点「继续运行」。",
+            { autoResume: true }
+          );
+          await waitWhilePaused();
+          dismissPauseDialog();
+          continue;
+        }
+        if (isTransientPlatformError(msg)) {
+          notifyPaused(
+            `检测到网络/页面异常：${msg.slice(0, 80)}。请刷新招聘列表页或等待网络恢复；约每 10 秒自动检测，恢复后继续当前岗位。`,
+            { autoResume: true }
           );
           await waitWhilePaused();
           dismissPauseDialog();
@@ -1573,6 +2103,8 @@ async function manualAnalyze() {
   let llmLabel = "";
   const { provider, apiKey } = resolveLlmConfig(settings);
   const fitForAi = effectiveFitScore(score);
+  const llmRequired =
+    !!apiKey && !score.excluded && fitForAi >= (settings.deepseekThreshold ?? 60);
   if (score.excluded) skipped = `避雷：${score.avoidHits.join("、")}`;
   else if (fitForAi < settings.deepseekThreshold)
     skipped = `低于阈值 ${settings.deepseekThreshold}（契合原分 ${fitForAi}）`;
@@ -1596,6 +2128,8 @@ async function manualAnalyze() {
   const result = enrichResult({
     order: ++state.order,
     job,
+    llmRequired,
+    hasLlmKey: !!apiKey,
     score,
     analysis,
     skippedDeepseek: skipped,
@@ -1640,13 +2174,7 @@ async function manualAnalyze() {
 }
 
 async function renderApplyList() {
-  applyUi.list = (await getApplyList()).slice().sort((a, b) => {
-    const sa = a.effectiveScore ?? a.fitTotal ?? a.total ?? 0;
-    const sb = b.effectiveScore ?? b.fitTotal ?? b.total ?? 0;
-    const td = sb - sa;
-    if (td !== 0) return td;
-    return (b.createdAt || b.updatedAt || 0) - (a.createdAt || a.updatedAt || 0);
-  });
+  applyUi.list = (await getApplyList()).slice().sort(compareApplyListRows);
   const total = applyUi.list.length;
   const pages = Math.max(1, Math.ceil(total / APPLY_LIST_PAGE_SIZE) || 1);
   if (applyUi.page >= pages) applyUi.page = pages - 1;
@@ -1665,16 +2193,51 @@ async function renderApplyList() {
       const company = escapeHtml(truncate(row.company || "-", 8));
       const source = escapeHtml(sourceLabel(row));
       const fit = row.fitTotal ?? row.effectiveScore;
-      const scoreTip =
-        fit != null && fit !== row.total
-          ? `展示 ${row.total ?? 0}% · 契合原分 ${fit}%`
-          : `${row.total ?? 0}%`;
-      const recMark = row.reviewFlag || row.recommendation === REC.REVIEW ? " · 待复核" : "";
+      const match = row.total ?? 0;
+      const recRaw =
+        row.recommendation ||
+        (row.reviewFlag ? REC.REVIEW : "") ||
+        "";
+      const recShort =
+        recRaw === REC.SUGGEST || recRaw === "建议投递"
+          ? "建议"
+          : recRaw === REC.REVIEW || recRaw === "待复核"
+            ? "待复核"
+            : recRaw === REC.CAUTION || recRaw === "谨慎投递" || recRaw === "谨慎"
+              ? "谨慎"
+              : recRaw === REC.EXCLUDE || recRaw === "已排除"
+                ? "排除"
+                : recRaw
+                  ? truncate(recRaw, 4)
+                  : "-";
+      // 建议 + 匹配度/契合原分合并一列（入库看契合≥阈值）
+      const scoreText =
+        fit != null && Number(fit) !== Number(match)
+          ? `${match}/${fit}`
+          : `${match}%`;
+      const tip = [
+        recRaw || "未分组",
+        `展示匹配度 ${match}%`,
+        fit != null ? `契合原分 ${fit}%（入库阈值看此项）` : "",
+        "点击查看分析"
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      const recClass =
+        recShort === "建议"
+          ? "rec-suggest"
+          : recShort === "待复核"
+            ? "rec-review"
+            : recShort === "谨慎"
+              ? "rec-caution"
+              : recShort === "排除"
+                ? "rec-exclude"
+                : "";
       return `<tr data-id="${escapeHtml(row.id)}">
         <td class="col-check"><input type="checkbox" class="apply-check" value="${escapeHtml(row.id)}" /></td>
         <td class="col-title"><span class="apply-cell" data-act="open" title="${escapeHtml(row.title || "")}（点击打开链接）">${title}</span></td>
         <td class="col-company"><span class="apply-cell muted" title="${escapeHtml(row.company || "")}">${company}</span></td>
-        <td class="col-score"><span class="apply-cell" data-act="analysis" title="点击查看分析结果：${escapeHtml(scoreTip)}${escapeHtml(recMark)}">${row.total ?? 0}%${row.reviewFlag ? "*" : ""}</span></td>
+        <td class="col-rec-score"><span class="apply-cell ${recClass}" data-act="analysis" title="${escapeHtml(tip)}"><span class="rec-tag">${escapeHtml(recShort)}</span> ${escapeHtml(scoreText)}</span></td>
         <td class="col-source"><span class="apply-cell muted" title="来源">${source}</span></td>
       </tr>`;
     })
@@ -1890,12 +2453,16 @@ function bindEvents() {
     toast("已从头开始", "ok");
   });
   $("btnPause").addEventListener("click", async () => {
-    state.paused = true;
     await checkpoint();
-    notifyPaused("已手动暂停（断点已保存）。需要时点「继续运行」。");
+    notifyPaused("已手动暂停（断点已保存）。需要时点「继续运行」。", {
+      autoResume: false,
+      autoResumeHint: true
+    });
   });
   const resumeRun = () => {
     state.paused = false;
+    state.autoResumeAllowed = false;
+    state.pauseReason = "";
     setPill("运行中", "busy");
     $("btnResume").disabled = true;
     const dlg = $("pauseDialog");
@@ -1935,9 +2502,9 @@ function bindEvents() {
         toast("投递列表为空", "error");
         return;
       }
-      toast("正在导出 Excel（CSV）…", "info");
+      toast("正在导出 Excel…", "info");
       const { filename, count } = await downloadApplyListExcel(list);
-      log(`投递列表已导出：${filename}（${count} 条）`);
+      log(`投递列表已导出：${filename}（${count} 条；已冻结表头，按匹配度/契合度/入列时间倒序）`);
       toast(`已导出 ${count} 条：${filename}`, "ok", 3500);
     } catch (e) {
       toast(`导出失败：${e.message || e}`, "error");

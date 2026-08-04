@@ -405,10 +405,10 @@ h3 {
 }
 
 .apply-table .col-check { width: 28px; }
-.apply-table .col-title { width: 30%; }
-.apply-table .col-company { width: 28%; }
-.apply-table .col-score { width: 18%; }
-.apply-table .col-source { width: 18%; }
+.apply-table .col-title { width: 26%; }
+.apply-table .col-company { width: 22%; }
+.apply-table .col-rec-score { width: 32%; }
+.apply-table .col-source { width: 14%; }
 
 .apply-cell {
   display: block;
@@ -418,6 +418,17 @@ h3 {
   cursor: pointer;
   color: var(--accent);
 }
+
+.apply-cell .rec-tag {
+  display: inline-block;
+  min-width: 2.5em;
+  font-weight: 600;
+}
+
+.apply-cell.rec-suggest { color: var(--accent); }
+.apply-cell.rec-review { color: #b45309; }
+.apply-cell.rec-caution { color: var(--muted); }
+.apply-cell.rec-exclude { color: var(--danger); }
 
 .apply-cell.muted { color: var(--ink); cursor: default; }
 
@@ -648,6 +659,34 @@ input[type="url"] {
 
 .pause-dialog-inner {
   padding: 16px;
+}
+
+.usage-notice-dialog {
+  width: min(420px, 94vw);
+}
+
+.usage-notice-body {
+  max-height: 240px;
+  overflow: auto;
+  text-align: left;
+  line-height: 1.5;
+}
+
+.usage-notice-body ul {
+  margin: 8px 0 0;
+  padding-left: 1.2em;
+}
+
+.usage-notice-body li {
+  margin: 4px 0;
+}
+
+.usage-notice-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 12px 0;
+  font-size: 13px;
 }
 
 .pause-dialog-inner h3 {

@@ -260,6 +260,8 @@ export function applyGateToScore(score, gates) {
   let next = { ...score };
   const failed = gates.failed || [];
   const domainFail = failed.some((a) => a.type === "domain");
+  // 压域前总分：待复核用此分，避免领域压到 15 后永远进不了待复核
+  const fitBeforeDomainCrush = next.total;
   // 域不符时压领域支柱（及旧行业维），避免原分虚高
   if (domainFail) {
     if (next.pillars?.domain) {
@@ -292,7 +294,15 @@ export function applyGateToScore(score, gates) {
       };
     }
     if (next.pillars) {
-      next.total = weightedPillarTotal(next.pillars, next.weights);
+      let t = weightedPillarTotal(next.pillars, next.weights);
+      const concrete = next.jdConcrete;
+      if (concrete && Number.isFinite(Number(concrete.score))) {
+        const scale = 0.5 + 0.5 * (Number(concrete.score) / 100);
+        t = Math.round(t * scale);
+        if (concrete.sparse) t = Math.min(t, 58);
+        else if (concrete.thin) t = Math.min(t, 72);
+      }
+      next.total = t;
     }
   }
 
@@ -301,6 +311,7 @@ export function applyGateToScore(score, gates) {
     return {
       ...next,
       fitTotal,
+      fitBeforeDomainCrush,
       gateStatus: "pass",
       gateLabel: "硬门槛通过",
       gateFailed: [],
@@ -311,6 +322,7 @@ export function applyGateToScore(score, gates) {
   return {
     ...next,
     fitTotal,
+    fitBeforeDomainCrush,
     total: capped,
     gateStatus: "fail",
     gateLabel: "硬门槛未过",

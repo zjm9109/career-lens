@@ -113,8 +113,16 @@ export function resolveLlmConfig(settings) {
   return { provider, apiKey: String(apiKey || "").trim() };
 }
 
-/** OpenAI 兼容 Chat Completions；供岗位分析 / 简历侧写复用 */
-export async function chatCompletion({ settings, system, user, temperature = 0.3 }) {
+/** 503/429/忙线/网络等可重试错误 */
+export function isTransientLlmError(msg) {
+  return /503|429|502|504|busy|too busy|service_unavailable|unavailable|rate.?limit|超时|timeout|Failed to fetch|network|ECONNRESET|ETIMEDOUT|暂时|繁忙|负载/i.test(
+    String(msg || "")
+  );
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function chatCompletionOnce({ settings, system, user, temperature = 0.3 }) {
   const { provider, apiKey } = resolveLlmConfig(settings);
   if (!apiKey) throw new Error(`未配置 ${provider.label} API Key`);
 
@@ -142,6 +150,38 @@ export async function chatCompletion({ settings, system, user, temperature = 0.3
   const text = data.choices?.[0]?.message?.content || "";
   if (!text) throw new Error(`${provider.label} 返回为空`);
   return { text: text.trim(), providerId: provider.id, providerLabel: provider.label };
+}
+
+/**
+ * OpenAI 兼容 Chat Completions；供岗位分析 / 简历侧写复用。
+ * 对 503/429/忙线等自动退避重试（默认最多 3 次）。
+ */
+export async function chatCompletion({
+  settings,
+  system,
+  user,
+  temperature = 0.3,
+  retries = 3
+}) {
+  const { provider } = resolveLlmConfig(settings);
+  let lastErr;
+  const max = Math.max(1, Number(retries) || 3);
+  for (let attempt = 1; attempt <= max; attempt++) {
+    try {
+      return await chatCompletionOnce({ settings, system, user, temperature });
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e?.message || e);
+      if (attempt >= max || !isTransientLlmError(msg)) throw e;
+      const waitMs = attempt === 1 ? 3000 : attempt === 2 ? 8000 : 15000;
+      console.warn(
+        `[career-lens] ${provider.label} 瞬时失败，${waitMs / 1000}s 后重试（${attempt}/${max}）`,
+        msg.slice(0, 120)
+      );
+      await sleep(waitMs);
+    }
+  }
+  throw lastErr;
 }
 
 export async function analyzeJobWithLlm({ settings, profile, job, score }) {

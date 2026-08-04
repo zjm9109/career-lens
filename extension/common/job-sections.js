@@ -58,6 +58,8 @@ function stripNoise(text) {
     const intro = s.search(/职位介绍|主要职责描述|岗位职责|工作职责|任职要求/);
     if (intro > 0) s = s.slice(intro);
   }
+  // 详情加载失败页常见前缀
+  s = s.replace(/数据加载失败|点击重新加载|网络不给力[，,]?请稍后重试/g, " ");
   const cutMarks = [
     "求职工具",
     "热门职位",
@@ -79,11 +81,43 @@ function stripNoise(text) {
     const i = s.indexOf(m);
     if (i >= 0 && (cutAt < 0 || i < cutAt)) cutAt = i;
   }
-  if (cutAt > 40) s = s.slice(0, cutAt);
+  // 页脚标记一律裁掉（此前要求 cutAt>40，失败页正文极短时会整段保留「热门职位…招聘」）
+  if (cutAt >= 0) s = s.slice(0, cutAt);
   // 工作地址起多为页脚
   const addr = s.search(/\n?工作地址/);
   if (addr > 80) s = s.slice(0, addr);
   return s.replace(/\u200b/g, "").replace(/[ \t]{2,}/g, " ").trim();
+}
+
+function hasJobStructure(text) {
+  return /任职要求|任职资格|岗位职责|工作职责|职位描述|岗位描述|职位介绍|主要职责/.test(
+    String(text || "")
+  );
+}
+
+/**
+ * 详情未真正加载：失败提示、VIP/页脚 SEO 云、大量「xx招聘」串联。
+ * 此类文本不得进入打分/建议投递。
+ */
+export function isUnusableJobDescription(text) {
+  const raw = String(text || "");
+  if (!raw.trim()) return true;
+  if (/数据加载失败|点击重新加载|网络不给力|页面出错了|系统繁忙/.test(raw)) return true;
+  if (/热门职位/.test(raw) && /热门城市|热门企业/.test(raw)) return true;
+  const hireCloud = (raw.match(/[\u4e00-\u9fffA-Za-z]{2,16}招聘/g) || []).length;
+  if (hireCloud >= 6) return true;
+  if (/求职工具\s*VIP|VIP已开通有效期/.test(raw) && !hasJobStructure(raw)) return true;
+
+  const cleaned = stripNoise(raw);
+  // 裁掉页脚/失败提示后空了 → 不可用
+  if (!cleaned.trim()) return true;
+  if (/热门职位|求职工具|数据加载失败/.test(cleaned)) return true;
+  if (hasJobStructure(cleaned) || hasJobStructure(raw)) return false;
+  // 无结构时需足够长且像职责表述，避免列表残片/页脚冒充 JD
+  if (cleaned.length >= 80 && /负责|熟悉|经验|要求|优先|本科|硕士|项目|交付|管理/.test(cleaned)) {
+    return false;
+  }
+  return true;
 }
 
 /**

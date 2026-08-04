@@ -2,6 +2,9 @@ import {
   DEFAULT_PROFILE,
   DEFAULT_SETTINGS,
   APPLY_LIST_MAX,
+  USAGE_NOTICE_VERSION,
+  DAILY_RISK_LOCK_COUNT,
+  DAILY_LIEPIN_DETAIL_OPEN_MAX,
   normalizeWeights
 } from "./constants.js";
 
@@ -11,8 +14,103 @@ const KEYS = {
   runState: "cl_run_state",
   applyList: "cl_apply_list",
   /** 同一筛选列表上的游标：接着往后筛，避免每次从第 1 条重跑 */
-  listSession: "cl_list_session"
+  listSession: "cl_list_session",
+  /** 使用须知勾选 + 当日风控/开详情计数（软锁，清扩展数据会重置） */
+  safety: "cl_safety"
 };
+
+function todayKey() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function emptyDayCounters() {
+  return { riskEvents: 0, detailOpens: 0, liepinDetailOpens: 0 };
+}
+
+export async function getSafetyState() {
+  const data = await chrome.storage.local.get(KEYS.safety);
+  const raw = data[KEYS.safety] || {};
+  const day = todayKey();
+  const dayCounters =
+    raw.day === day ? { ...emptyDayCounters(), ...(raw.dayCounters || {}) } : emptyDayCounters();
+  return {
+    noticeVersion: Number(raw.noticeVersion) || 0,
+    noticeAcceptedAt: raw.noticeAcceptedAt || 0,
+    day,
+    dayCounters
+  };
+}
+
+async function saveSafetyState(next) {
+  await setLocalSafe({ [KEYS.safety]: next });
+}
+
+export async function isUsageNoticeAccepted() {
+  const s = await getSafetyState();
+  return s.noticeVersion >= USAGE_NOTICE_VERSION && !!s.noticeAcceptedAt;
+}
+
+export async function acceptUsageNotice() {
+  const s = await getSafetyState();
+  await saveSafetyState({
+    ...s,
+    noticeVersion: USAGE_NOTICE_VERSION,
+    noticeAcceptedAt: Date.now()
+  });
+}
+
+/**
+ * 当日是否允许精筛。
+ * @returns {{ ok: boolean, reason?: string, safety: object }}
+ */
+export async function checkDailySafetyGate(platformId = "") {
+  const s = await getSafetyState();
+  const { riskEvents, liepinDetailOpens } = s.dayCounters;
+  if (riskEvents >= DAILY_RISK_LOCK_COUNT) {
+    return {
+      ok: false,
+      reason: `今日已触发平台风控 ${riskEvents} 次（≥${DAILY_RISK_LOCK_COUNT}），精筛已暂停至明天。请勿通过重装规避；账号需休息。`,
+      safety: s
+    };
+  }
+  if (platformId === "liepin" && liepinDetailOpens >= DAILY_LIEPIN_DETAIL_OPEN_MAX) {
+    return {
+      ok: false,
+      reason: `今日猎聘已打开详情 ${liepinDetailOpens} 次（上限 ${DAILY_LIEPIN_DETAIL_OPEN_MAX}），请明天再继续以降低封号风险。`,
+      safety: s
+    };
+  }
+  return { ok: true, safety: s };
+}
+
+/** 记录一次风控事件（短信/行为异常等） */
+export async function recordRiskEvent(kind = "risk") {
+  const s = await getSafetyState();
+  const dayCounters = { ...s.dayCounters, riskEvents: (s.dayCounters.riskEvents || 0) + 1 };
+  await saveSafetyState({ ...s, day: todayKey(), dayCounters });
+  return {
+    ...dayCounters,
+    locked: dayCounters.riskEvents >= DAILY_RISK_LOCK_COUNT,
+    kind
+  };
+}
+
+/** 记录一次真正打开详情 */
+export async function recordDetailOpen(platformId = "") {
+  const s = await getSafetyState();
+  const dayCounters = {
+    ...s.dayCounters,
+    detailOpens: (s.dayCounters.detailOpens || 0) + 1,
+    liepinDetailOpens:
+      platformId === "liepin"
+        ? (s.dayCounters.liepinDetailOpens || 0) + 1
+        : s.dayCounters.liepinDetailOpens || 0
+  };
+  await saveSafetyState({ ...s, day: todayKey(), dayCounters });
+  return dayCounters;
+}
 
 export async function getProfile() {
   const data = await chrome.storage.local.get(KEYS.profile);
@@ -208,8 +306,66 @@ export async function getApplyList() {
   return Array.isArray(data[KEYS.applyList]) ? data[KEYS.applyList] : [];
 }
 
+function applyRowMatch(row) {
+  return Number(row?.total) || 0;
+}
+
+function applyRowFit(row) {
+  return Number(row?.fitTotal ?? row?.effectiveScore) || 0;
+}
+
+/**
+ * 满员淘汰：优先分数最低（匹配度 → 契合原分），同分取入列时间最远（最旧）。
+ * @returns {number} 应移除的下标
+ */
+export function pickApplyListEvictionIndex(list) {
+  if (!list?.length) return -1;
+  let worst = 0;
+  for (let i = 1; i < list.length; i++) {
+    const a = list[i];
+    const b = list[worst];
+    const ma = applyRowMatch(a);
+    const mb = applyRowMatch(b);
+    if (ma !== mb) {
+      if (ma < mb) worst = i;
+      continue;
+    }
+    const fa = applyRowFit(a);
+    const fb = applyRowFit(b);
+    if (fa !== fb) {
+      if (fa < fb) worst = i;
+      continue;
+    }
+    if ((Number(a.createdAt) || 0) < (Number(b.createdAt) || 0)) worst = i;
+  }
+  return worst;
+}
+
+/** 超出上限时反复淘汰最低分+最旧入列，直至 ≤ APPLY_LIST_MAX */
+function trimApplyListToMax(list) {
+  const out = [...(list || [])];
+  while (out.length > APPLY_LIST_MAX) {
+    const i = pickApplyListEvictionIndex(out);
+    if (i < 0) break;
+    out.splice(i, 1);
+  }
+  return out;
+}
+
+function sortApplyListRows(list) {
+  return [...(list || [])].sort((a, b) => {
+    const ma = applyRowMatch(a);
+    const mb = applyRowMatch(b);
+    if (mb !== ma) return mb - ma;
+    const fa = applyRowFit(a);
+    const fb = applyRowFit(b);
+    if (fb !== fa) return fb - fa;
+    return (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0);
+  });
+}
+
 export async function saveApplyList(list) {
-  const trimmed = (list || []).slice(0, APPLY_LIST_MAX).map((item) => {
+  const trimmed = trimApplyListToMax(list || []).map((item) => {
     if (!item?.job) return item;
     return compactResultForStorage(item);
   });
@@ -238,20 +394,21 @@ export async function upsertApplyListItem(item, threshold) {
     createdAt: prev?.createdAt || item.createdAt || now,
     updatedAt: now
   };
-  if (idx >= 0) list[idx] = { ...prev, ...row, createdAt: prev.createdAt || row.createdAt };
-  else list.unshift(row);
+  let evicted = null;
+  if (idx >= 0) {
+    list[idx] = { ...prev, ...row, createdAt: prev.createdAt || row.createdAt };
+  } else {
+    // 第 101 条：先去掉分数最低且入列时间最远的一条，再插入
+    if (list.length >= APPLY_LIST_MAX) {
+      const evictAt = pickApplyListEvictionIndex(list);
+      if (evictAt >= 0) evicted = list.splice(evictAt, 1)[0] || null;
+    }
+    list.unshift(row);
+  }
 
-  // 有效分（契合原分优先）降序，同分按入列时间新→旧
-  list.sort((a, b) => {
-    const sa = a.effectiveScore ?? a.fitTotal ?? a.total ?? 0;
-    const sb = b.effectiveScore ?? b.fitTotal ?? b.total ?? 0;
-    const td = sb - sa;
-    if (td !== 0) return td;
-    return (b.createdAt || b.updatedAt || 0) - (a.createdAt || a.updatedAt || 0);
-  });
-  const trimmed = list.slice(0, APPLY_LIST_MAX);
+  const trimmed = sortApplyListRows(trimApplyListToMax(list));
   await saveApplyList(trimmed);
-  return { list: trimmed, added: true };
+  return { list: trimmed, added: true, evicted };
 }
 
 export async function removeApplyListIds(ids) {
@@ -269,3 +426,9 @@ export async function patchApplyListStatus(ids, applyStatus) {
   await saveApplyList(list);
   return list;
 }
+
+export {
+  USAGE_NOTICE_VERSION,
+  DAILY_RISK_LOCK_COUNT,
+  DAILY_LIEPIN_DETAIL_OPEN_MAX
+};
