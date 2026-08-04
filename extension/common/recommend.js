@@ -26,13 +26,52 @@ export const DEEPSEEK_PRICE = {
 
 export const REC = {
   SUGGEST: "建议投递",
+  REVIEW: "待复核",
   CAUTION: "谨慎投递",
   EXCLUDE: "已排除"
 };
 
+/** 待复核：门禁压分 / 规则分偏低时的契合原分门槛 */
+export const REVIEW_FIT_HIGH = 70;
+export const REVIEW_FIT_DIR = 65;
+
+/** 入库/分析用有效分：优先契合原分，避免门禁封顶导致漏召回 */
+export function effectiveFitScore(score) {
+  if (!score) return 0;
+  const fit = Number(score.fitTotal);
+  if (Number.isFinite(fit)) return fit;
+  return Number(score.total) || 0;
+}
+
+function directionTitleHit(job, profile) {
+  const dirs = (profile?.directions || []).filter(Boolean);
+  if (!dirs.length) return false;
+  const title = String(job?.title || "");
+  return dirs.some((d) => d && title.includes(String(d)));
+}
+
+/**
+ * 防漏：高契合被门禁压住，或门禁过了但展示分偏低且方向仍贴
+ */
+export function needsHumanReview(score, job, profile) {
+  if (!score || score.excluded) return false;
+  const fit = effectiveFitScore(score);
+  const total = Number(score.total) || 0;
+
+  if (score.gateStatus === "fail") {
+    return fit >= REVIEW_FIT_HIGH;
+  }
+
+  // 门禁通过：展示分偏低 + 契合原分仍高（或方向贴且略放宽）
+  if (total < 60 && fit >= REVIEW_FIT_HIGH) return true;
+  if (total < 60 && fit >= REVIEW_FIT_DIR && directionTitleHit(job, profile)) return true;
+  return false;
+}
+
 const ANALYSIS_LABELS = [
   "一句话结论",
   "岗位成分识别",
+  "必备能力识别",
   "匹配亮点",
   "风险/缺口",
   "是否建议投递",
@@ -79,7 +118,11 @@ const HARD_CERT_ALIASES = [
   { key: "PMP", re: /\bPMP\b|项目管理专业人士/i },
   { key: "ACP", re: /\bACP\b|敏捷认证/i },
   { key: "信息系统项目管理师", re: /信息系统项目管理师|软考高项|高项/ },
-  { key: "建造师", re: /一级建造师|二级建造师|建造师/ },
+  { key: "一级机电建造师", re: /一级机电建造师/ },
+  { key: "机电建造师", re: /机电建造师/ },
+  { key: "一级建造师", re: /一级建造师/ },
+  { key: "二级建造师", re: /二级建造师/ },
+  { key: "建造师", re: /建造师/ },
   { key: "英语六级", re: /英语六级|CET-?6/i },
   { key: "英语四级", re: /英语四级|CET-?4/i }
 ];
@@ -102,6 +145,7 @@ function profileHasCert(profile, key) {
   if (bag.includes(k)) return true;
   if (key === "信息系统项目管理师" && /软考|高项/.test(bag)) return true;
   if (key === "PMP" && /pmp/.test(bag)) return true;
+  if (/建造师/.test(key)) return /建造师|一建|二建/.test(bag);
   return false;
 }
 
@@ -152,11 +196,19 @@ export function parseAdviceFromAnalysis(analysis) {
 }
 
 /**
- * 分组：排除 > 谨慎（模型/硬缺口/低分）> 建议投递
+ * 分组顺序：建议投递 → 待复核 → 谨慎投递 → 已排除
+ * 门禁 FAIL 且高契合 → 待复核（不得「建议投递」）；低契合门禁失败 → 谨慎
  */
 export function getRecommendation(result) {
   const score = result?.score || {};
   if (score.excluded) return REC.EXCLUDE;
+
+  if (needsHumanReview(score, result?.job, result?.profile)) return REC.REVIEW;
+
+  if (score.gateStatus === "fail") return REC.CAUTION;
+
+  // JD 过空/套话：即使标签命中也不「建议投递」
+  if (score.jdConcrete?.sparse) return REC.CAUTION;
 
   const advice = parseAdviceFromAnalysis(result?.analysis);
   if (advice === "不建议" || advice === "谨慎") return REC.CAUTION;
@@ -174,14 +226,19 @@ export function getRecommendation(result) {
 
 function normalizeRecLabel(rec) {
   if (rec === REC.SUGGEST || rec === "建议投递") return REC.SUGGEST;
+  if (rec === REC.REVIEW || rec === "待复核") return REC.REVIEW;
   if (rec === REC.CAUTION || rec === "谨慎" || rec === "谨慎投递") return REC.CAUTION;
   if (rec === REC.EXCLUDE || rec === "排除" || rec === "已排除") return REC.EXCLUDE;
   return REC.CAUTION;
 }
 
+/** 导出 / 侧栏分组顺序 */
+export const REC_ORDER = [REC.SUGGEST, REC.REVIEW, REC.CAUTION, REC.EXCLUDE];
+
 export function groupResultsByRecommendation(results) {
   const buckets = {
     [REC.SUGGEST]: [],
+    [REC.REVIEW]: [],
     [REC.CAUTION]: [],
     [REC.EXCLUDE]: []
   };
@@ -189,9 +246,16 @@ export function groupResultsByRecommendation(results) {
     const rec = normalizeRecLabel(r.recommendation || getRecommendation(r));
     buckets[rec].push({ ...r, recommendation: rec });
   }
-  // 组内按匹配度降序
+  // 组内：待复核按契合原分，其余按展示分
   for (const k of Object.keys(buckets)) {
-    buckets[k].sort((a, b) => (b.score?.total ?? 0) - (a.score?.total ?? 0));
+    buckets[k].sort((a, b) => {
+      const sa =
+        k === REC.REVIEW ? effectiveFitScore(a.score) : a.score?.total ?? 0;
+      const sb =
+        k === REC.REVIEW ? effectiveFitScore(b.score) : b.score?.total ?? 0;
+      if (sb !== sa) return sb - sa;
+      return (a.order ?? 0) - (b.order ?? 0);
+    });
   }
   return buckets;
 }
@@ -211,5 +275,9 @@ export function splitAnalysisLine(line) {
 
 export function enrichResult(result) {
   const recommendation = getRecommendation(result);
-  return { ...result, recommendation };
+  return {
+    ...result,
+    recommendation,
+    reviewFlag: recommendation === REC.REVIEW
+  };
 }

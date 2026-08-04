@@ -25,7 +25,7 @@
 
   <main>
     <section id="tab-run" class="panel active">
-      <p class="hint">打开招聘列表筛选后开始。同一列表未改筛时，再次开始会从上次位置接着往后跑。列表变了或点「从头」才从第 1 条重来。中途中断用「续跑」。</p>
+      <p class="hint">打开招聘列表筛选后开始。同一列表未改筛时，再次开始会从上次位置接着往后跑。列表变了或点「从头」才从第 1 条重来。中途中断用「续跑」。猎聘有分页且风控较严：建议本批≤8，出现「账号行为异常」先短信验证再继续。</p>
       <div class="row">
         <label>本批条数
           <select id="batchSize"></select>
@@ -70,7 +70,7 @@
         <pre id="log" class="log"></pre>
       </div>
       <div class="results-wrap">
-        <div class="log-head results-head-sticky"><span>本批结果</span><span id="resultCount">0</span></div>
+        <div class="log-head results-head-sticky"><span>本批结果</span><span id="resultCount" title="仅本批；接着筛选时累计另计">0</span></div>
         <div id="resultList" class="result-list"></div>
       </div>
     </section>
@@ -88,54 +88,72 @@
           <button type="button" id="btnSuggest" class="secondary">从文本提取标签</button>
         </div>
 
+        <div class="pack-box">
+          <h3>职业包与适合岗位</h3>
+          <p id="packLabel" class="pack-label">软件/IT 交付型项目经理</p>
+          <p class="hint">当前按该职业包做门禁与契合分析；其他契合度高的类型也可分析，见下方列表。</p>
+          <p class="subhead">适合分析的岗位类型</p>
+          <ul id="suitableRoles" class="role-list"></ul>
+          <p class="subhead">通常需谨慎</p>
+          <ul id="cautiousRoles" class="role-list muted-list"></ul>
+        </div>
+
+        <div class="side-report-box">
+          <h3>简历侧写</h3>
+          <p class="hint">提取标签后自动生成规则侧写（有分析内容）。配置模型后可点「生成 AI 侧写」增强；保存画像时一并写入。</p>
+          <div class="actions">
+            <button type="button" id="btnRuleReport" class="secondary">刷新规则侧写</button>
+            <button type="button" id="btnAiReport" class="secondary">生成 AI 侧写</button>
+          </div>
+          <pre id="profileReportOut" class="profile-report"></pre>
+        </div>
+
         <label class="block">工作年限（年，必填，0–50 整数）
           <input id="yearsExperience" type="number" min="0" max="50" step="1" required placeholder="如 8" />
         </label>
 
-        <p class="hint">每项右侧为该维权重。修改后须点「确认权重」，合计必须为 100 才生效；否则沿用上次已确认的权重。岗位无某维要求时该维中性 100 属正常。</p>
+        <p class="hint">标签描述你的事实（供规则门禁与语义比对）。契合打分改为四维：角色 / 领域 / 能力 / 资质——有 API Key 时用语义或向量相关性，不再靠职业包词表硬套。</p>
 
+        <label class="block">技能标签（逗号/换行分隔）
+          <textarea id="skills" class="tag-area" rows="2" placeholder="项目管理, 实施交付, Java"></textarea>
+        </label>
+        <label class="block">行业标签
+          <textarea id="industries" class="tag-area" rows="2" placeholder="金融, 证券, 互联网"></textarea>
+        </label>
+        <label class="block">目标方向词
+          <textarea id="directions" class="tag-area" rows="2" placeholder="项目经理, PMO, 交付经理"></textarea>
+        </label>
+        <label class="block">证书标签
+          <textarea id="certificates" class="tag-area" rows="2" placeholder="PMP, 软考"></textarea>
+        </label>
+        <label class="block">语言标签
+          <textarea id="languages" class="tag-area" rows="2" placeholder="英语, 英语六级"></textarea>
+        </label>
+
+        <h3>契合四维权重</h3>
+        <p class="hint">角色=岗位干什么；领域=哪个行业场景；能力=会不会干；资质=证书年限语言等。合计须为 100，点「确认权重」生效。</p>
         <div class="field-weight">
-          <label class="grow">技能标签（逗号/换行分隔，可拉伸）
-            <textarea id="skills" class="tag-area" rows="2" placeholder="项目管理, 实施交付, Java"></textarea>
-          </label>
+          <label class="grow">角色契合</label>
           <label class="w-mini">权重
-            <input id="wSkill" class="weight-input" type="number" min="0" max="100" step="1" />
+            <input id="wRole" class="weight-input" type="number" min="0" max="100" step="1" />
           </label>
         </div>
-
         <div class="field-weight">
-          <label class="grow">行业标签
-            <textarea id="industries" class="tag-area" rows="2" placeholder="金融, 证券, 互联网"></textarea>
-          </label>
+          <label class="grow">领域契合</label>
           <label class="w-mini">权重
-            <input id="wIndustry" class="weight-input" type="number" min="0" max="100" step="1" />
+            <input id="wDomain" class="weight-input" type="number" min="0" max="100" step="1" />
           </label>
         </div>
-
         <div class="field-weight">
-          <label class="grow">目标方向词
-            <textarea id="directions" class="tag-area" rows="2" placeholder="项目经理, PMO, 交付经理"></textarea>
-          </label>
+          <label class="grow">能力契合</label>
           <label class="w-mini">权重
-            <input id="wDirection" class="weight-input" type="number" min="0" max="100" step="1" />
+            <input id="wCapability" class="weight-input" type="number" min="0" max="100" step="1" />
           </label>
         </div>
-
         <div class="field-weight">
-          <label class="grow">证书标签
-            <textarea id="certificates" class="tag-area" rows="2" placeholder="PMP, 软考"></textarea>
-          </label>
+          <label class="grow">资质条件</label>
           <label class="w-mini">权重
-            <input id="wCertificate" class="weight-input" type="number" min="0" max="100" step="1" />
-          </label>
-        </div>
-
-        <div class="field-weight">
-          <label class="grow">语言标签
-            <textarea id="languages" class="tag-area" rows="2" placeholder="英语, 英语六级"></textarea>
-          </label>
-          <label class="w-mini">权重
-            <input id="wLanguage" class="weight-input" type="number" min="0" max="100" step="1" />
+            <input id="wQualify" class="weight-input" type="number" min="0" max="100" step="1" />
           </label>
         </div>
         <div class="weight-actions">
@@ -196,9 +214,9 @@
     </section>
 
     <section id="tab-apply" class="panel">
-      <p class="hint">达标岗位汇入此处。点击岗位名打开链接；匹配度点击查看分析。支持多选批量打开/删除。每页 30 条，最多 100 条。</p>
+      <p class="hint">达标岗位汇入此处（按契合原分判断，含待复核防漏岗）。点击岗位名打开链接；匹配度点击查看分析。支持多选批量打开/删除。每页 30 条，最多 100 条。「导出 Excel」为 CSV，可用 Excel 直接打开。</p>
       <div class="apply-threshold-row">
-        <label class="apply-threshold">入库阈值（≥该分且未排除）
+        <label class="apply-threshold">入库阈值（≥该契合原分且未排除）
           <span class="inline-field">
             <input id="applyListThreshold" type="number" min="0" max="100" />
             <button type="button" id="btnApplySaveTh" class="secondary">保存阈值</button>
@@ -209,6 +227,7 @@
         <label class="checkbox-row"><input type="checkbox" id="applySelectAll" /> 全选本页</label>
         <button type="button" id="btnApplyOpen" class="secondary">打开选中</button>
         <button type="button" id="btnApplyDelete" class="secondary">删除选中</button>
+        <button type="button" id="btnApplyExport" class="secondary" title="导出全部投递列表为 CSV（Excel 可打开）">导出 Excel</button>
         <button type="button" id="btnApplyRefresh" class="link">刷新</button>
       </div>
       <div id="applyMeta" class="apply-meta">0 条</div>

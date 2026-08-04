@@ -50,11 +50,13 @@
     // 去掉嵌入的 CSS 规则块
     s = s.replace(/\.[A-Za-z0-9_-]{2,80}\s*\{[^}]*\}/g, " ");
     s = s.replace(/\{[^}]{0,200}display\s*:\s*(?:none|inline-block)[^}]*\}/gi, " ");
-    // 常见水印噪声
+    // 常见水印噪声；并去掉汉字间插入的「直聘」（反爬：AI漫直聘剧→AI漫剧）
     s = s.replace(/来自BOSS直聘/g, "");
     s = s.replace(/BOSS直聘/g, "");
+    s = s.replace(/直聘/g, "");
     s = s.replace(/kanzhun/gi, "");
     s = s.replace(/\bboss\b/gi, "");
+    s = s.replace(/⼯/g, "工").replace(/⽬/g, "目").replace(/⾼/g, "高");
     // UI 操作区噪声（若被拼进正文）
     s = s.replace(/收藏\s*立即沟通\s*举报[\s\S]{0,40}不合适/g, "\n");
     s = s.replace(/微信扫码分享/g, "");
@@ -550,6 +552,9 @@
             break;
           case "CL_SCROLL":
             sendResponse(await scrollJobList());
+            break;
+          case "CL_NEXT_PAGE":
+            sendResponse({ ok: false, grew: false, reason: "Boss 使用下拉加载，无需翻页" });
             break;
           default:
             sendResponse({ ok: false, reason: "unknown type" });

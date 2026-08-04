@@ -1,6 +1,7 @@
 # career-lens 技术学习 / 微调手册
 
-面向自己改代码、调分数、跟 Boss 改版。需求说明见 [SPEC.md](./SPEC.md)。
+面向自己改代码、调分数、跟 Boss 改版。  
+需求：[SPEC.md](./SPEC.md)（v0.3）· 本轮增量：[CHANGELOG.md](./CHANGELOG.md)
 
 ---
 
@@ -8,183 +9,166 @@
 
 ```
 career-lens/
-├── README.md                 # 安装与简介
+├── README.md
 ├── LICENSE
-├── package.json              # 仅开发时拉 pdfjs；运行扩展不依赖 npm
-├── node_modules/             # 可删；扩展使用已拷贝的 vendor
+├── package.json
+├── images/                   # 安装说明截图（仓库根）
 ├── docs/
-│   ├── SPEC.md               # 产品说明书
+│   ├── SPEC.md               # 产品说明书 v0.3
 │   ├── TECH.md               # 本文件
-│   └── *.pdf                 # 本地测试简历（含隐私，勿提交）
+│   ├── CHANGELOG.md          # ★ 本轮增加内容与后续方向
+│   └── *.pdf                 # 本地测试简历（gitignore，勿提交）
 └── extension/                # ← Chrome「加载已解压扩展」选这个目录
-    ├── manifest.json         # MV3 清单：权限、content_scripts、side_panel
-    ├── background.js         # 点击图标打开侧边栏
-    ├── icons/                # 扩展图标
-    ├── vendor/pdfjs/         # 本地 pdf.js（解析中文 PDF，勿删）
-    ├── common/               # 与平台无关的公共逻辑
-    │   ├── constants.js      # 默认避雷词、默认权重、阈值默认值
-    │   ├── storage.js        # 画像/设置/断点/投递列表
-    │   ├── scoring.js        # ★ 规则打分（最常微调）
-    │   ├── recommend.js      # 建议分组、硬门槛、DeepSeek 费用估算
-    │   ├── deepseek.js       # DeepSeek 提示词与请求
-    │   ├── export.js         # 分组导出 MD/Word
-    │   ├── job-sections.js   # JD 四块结构化
-    │   └── resume-parse.js   # PDF/DOCX/TXT 解析 + 标签预填词典
+    ├── manifest.json         # MV3（0.3.0，含 unlimitedStorage）
+    ├── background.js
+    ├── icons/
+    ├── vendor/pdfjs/
+    ├── common/
+    │   ├── constants.js      # 默认避雷、权重、画像/设置默认
+    │   ├── storage.js        # ★ 断点压缩 / 配额保护
+    │   ├── pillars.js        # ★ 契合四维定义与权重迁移
+    │   ├── semantic-score.js # ★ embedding / LLM 语义四维
+    │   ├── scoring.js        # ★ 或选单元、PM 隐含、福利过滤、合并语义分
+    │   ├── gates.js          # 硬门槛门禁（PASS/FAIL）
+    │   ├── packs/            # 职业包（展示适合岗位 + 无 Key 域兜底）
+    │   │   └── it-delivery-pm.js
+    │   ├── profile-report.js # 规则侧写 + AI 侧写
+    │   ├── recommend.js      # 建议分组、待复核
+    │   ├── llm.js            # 多模型 Chat Completions
+    │   ├── export.js
+    │   ├── job-sections.js   # ★ 猎聘顶栏/公司简介裁切
+    │   ├── resume-parse.js
+    │   └── platform.js
     ├── platforms/
-    │   └── boss/
-    │       └── content.js    # ★ Boss DOM 采集 / CL_HEALTH
+    │   ├── boss|liepin|zhilian/content.js  # 猎聘：分页、风控、职位介绍就绪
     └── sidepanel/
-        ├── index.html        # 运行/画像/设置/精确分析/投递列表
+        ├── index.html
         ├── style.css
-        └── app.js            # ★ 编排：批次、断点、投递列表、导出
+        └── app.js            # scoreJobFull、猎聘节奏、checkpoint
 ```
-
-后期加猎聘/智联：在 `platforms/` 下新建目录，复制 Boss 的消息协议，公共逻辑不动。
 
 ---
 
-## 2. 运行时数据流
+## 2. 运行时数据流（v0.3）
 
 ```
-[Boss 页面 content.js]
-        ↑ chrome.tabs.sendMessage (CL_LIST / CL_OPEN_INDEX / …)
-[sidepanel/app.js]
-        → scoring.scoreJob(profile, job, settings)
-        → deepseek.analyzeWithDeepseek（未排除且分数≥阈值）
-        → content CL_FAVORITE（未排除且分数≥收藏阈值）
-        → export.resultsToMarkdown → chrome.downloads
+简历 → 标签 + 规则侧写（必）/ AI 侧写（可选）→ 保存画像
+岗位 → scoreJobFull：
+         1) scoreJob 规则四维（无 Key 兜底）+ 硬门槛
+         2) 有 Key → semantic-score（向量或 LLM）合并四维；域语义低 → 门禁 FAIL
+         3) getRecommendation：避雷 / 待复核 / 建议 / 谨慎
+AI：按 effectiveFitScore(fitTotal) ≥ 分析阈值
+收藏：仅「建议投递」且达收藏阈值
+投递列表：effectiveFitScore ≥ 入库阈值；可导出 CSV
 ```
-
-画像与设置存在 `chrome.storage.local`：
 
 | Key | 内容 |
 |-----|------|
-| `cl_profile` | 技能/行业/方向/证书/语言、避雷、注意、简历文本 |
-| `cl_settings` | API Key、阈值、批次、导出模式、**权重** |
-
-权重 UI 在「画像」页，和标签并列；持久化仍在 `cl_settings.weights`。
+| `cl_profile` | 标签、避雷、简历文本、`careerPackId`、`profileReport` |
+| `cl_settings` | API Keys、阈值、批次、导出、权重 |
 
 ---
 
 ## 3. 常改文件速查
 
-| 想改什么 | 改哪个文件 | 提示 |
-|----------|------------|------|
-| 默认避雷词 | `common/constants.js` → `DEFAULT_AVOID_TAGS` | |
-| 默认权重 40/20/15… | `common/constants.js` → `DEFAULT_WEIGHTS` | |
-| 技能覆盖率软/硬 | `common/scoring.js` → `softCoverage` / `scoreSkill` | 现用 sqrt 软化 |
-| 行业/方向/证书算法 | `common/scoring.js` 各 `score*` | |
-| 简历预填词典 | `common/resume-parse.js` → `suggestProfileFromText` 里 `*Dict` | |
-| DeepSeek 输出格式 | `common/deepseek.js` → `SYSTEM` | |
-| MD / Word 导出 | `common/export.js` | `exportFormat`: md / docx |
-| 岗位四块结构化 | `common/job-sections.js` | 标签/职责/任职/加分；纠标题 |
-| 点击间隔、批次休息 | `sidepanel/app.js` → `processOneJob` / `runBatch` | |
-| Boss 列表/详情选不中 | `platforms/boss/content.js` 选择器 | 用 DevTools 看 class |
-| 链接变成搜索页 / 摘要含广告销售 | `content.js` 的 `cleanJobText` / `jobUrlFromId` | SPA 侧栏不改 URL；须裁切页脚 |
-| 薪资变成  乱码 | Boss 私有字体防爬 | 能解则解；否则带提示，非接口封锁 |
-| PDF 乱码 | 确认用了 `vendor/pdfjs`；扫描件需 OCR（未做） | |
+| 想改什么 | 改哪个文件 |
+|----------|------------|
+| 门禁规则（证书/语言/年限/域） | `common/gates.js` |
+| 封顶分 35 | `gates.js` → `GATE_SCORE_CAP` |
+| 职业包适合岗位 / 无 Key 域词 | `common/packs/it-delivery-pm.js` |
+| 规则契合 + 合并语义 | `common/scoring.js` |
+| 侧写文案与结构 | `common/profile-report.js` |
+| 契合四维定义/权重 | `common/pillars.js` |
+| 语义/向量打分 | `common/semantic-score.js` |
+| 导出 MD/Word / 投递 CSV | `common/export.js` |
+| 侧栏编排 | `sidepanel/app.js` |
 
 ---
 
-## 4. 打分公式（便于手算对照）
+## 4. 打分与门禁
 
 ```
-维度分 ∈ [0,100]
-规则分 = Σ(维度分 × 权重%) ，权重自动归一
+硬门槛（规则）：证书 / 年限 / 工作语言
+契合四维：角色 25 / 领域 30 / 能力 30 / 资质 15
+  有 Key → semantic-score（OpenAI/通义 embedding 余弦；否则 LLM JSON）
+  无 Key → 规则映射 + 职业包 domainMustHints 兜底
+领域语义分 <35 → 域门禁 FAIL（替代写死「每个行业一个大 JSON」）
+fitTotal = Σ(四维 × 权重)；门禁 FAIL → total=min(fit,35)
+JD具体度偏低 → 缩放/封顶；稀疏 JD 不得「建议投递」
 
-技能：硬要求命中数/要求数 ×100（默认，如 8/10→80）；「优先」技能不进分母；无硬要求→100
-行业/证书/语言：任职要求分句无「优先」→ 硬要求，按命中比例（或 0/100）；仅「优先」→ 不扣分
-方向：标题命中 100；任职硬方向按比例；仅正文 70；都无 0
-总分：Σ(维度分 × 权重%)，权重在画像页配置并归一
-
-避雷命中 → excluded=true，仍算规则分，不调 DeepSeek，不自动收藏
-注意命中 → 只展示
-DeepSeek：!excluded && total >= deepseekThreshold（默认 60）
-收藏：!excluded && total >= favoriteThreshold（默认 80）且页面未收藏
+需求单元（scoring.js）：
+  「至少一种 / A或B」→ mode:any，命中其一即覆盖
+  能力分 = 已覆盖单元 / 全部单元
+  PM 背景 → 评审会/归档/复盘等 routine 隐含命中
+  福利 chips 不进 must
 ```
 
----
+待复核：`REVIEW_FIT_HIGH=70`（`recommend.js`）。
 
-## 4.1 如何增加评分规则（推荐改法）
-
-所有规则分只改 **`extension/common/scoring.js`**，入口是 `scoreJob`。
-
-### 例：任职要求「电力行业经验」且无「优先」→ 行业维必须为 0（若画像无电力）
-
-已实现于 `scoreIndustry` + `classifyIndustryMentions`：
-
-1. `extractRequirementsText(job)` 切开「任职要求」段  
-2. 按句扫描 `KNOWN_INDUSTRIES`  
-3. 句内有「优先/加分」→ soft；有「经验/背景」且无优先 → hard  
-4. hard 未命中用户 `profile.industries` → **行业分 = 0**
-
-### 你要加「新行业词」
-
-改 `KNOWN_INDUSTRIES` 数组，例如增加 `"光伏"`。
-
-### 你要加「新的一维分数」（如：年限硬门槛）
-
-1. 新写 `function scoreYears(job, profile) { return { score, detail }; }`  
-2. 在 `scoreJob` 里算出来并加权（同时在 `constants.js` 的 `DEFAULT_WEIGHTS` 加一项，画像 UI 加权重输入）  
-3. 硬/软判断复用「分句 + 是否含优先」模式，避免和行业逻辑两套风格  
-
-### 你要改「证书必须 / 优先」
-
-仿行业：在 `scoreCertificate` 里对「PMP」等做分句 hard/soft（当前证书维仍偏覆盖率，可按同样模式收紧）。
-
-### 自测（仓库根目录）
+### 自测门禁（仓库根目录）
 
 ```bash
 node --input-type=module -e "
 import { scoreJob } from './extension/common/scoring.js';
 import { DEFAULT_SETTINGS } from './extension/common/constants.js';
-const profile = { skills:['PMP'], industries:['金融'], directions:['项目经理'], certificates:['PMP'], languages:[] };
-const job = { title:'项目经理', keywords:[], description:'任职要求：3. 有电力行业背景，具备项目管理经验。' };
-console.log(scoreJob(job, profile, DEFAULT_SETTINGS).dimensions.industry);
+const profile = {
+  skills:['项目管理'], industries:['金融'], directions:['项目经理'],
+  certificates:['PMP'], languages:[], yearsExperience: 8, resumeText:''
+};
+const job = {
+  title:'热力项目经理', keywords:[],
+  requirements:'任职要求：1. 持有一级机电建造师证书；2. 英语可作为工作语言。'
+};
+const s = scoreJob(job, profile, DEFAULT_SETTINGS);
+console.log({ total:s.total, fitTotal:s.fitTotal, gate:s.gateStatus, failed:s.gateFailed });
 "
 ```
 
-期望：`score: 0`，detail 含「硬性行业未满足」。
+期望：`gate: 'fail'`，`total ≤ 35`，失败项含证书与语言。
 
 ---
 
-## 5. Boss 消息协议（content ↔ sidepanel）
+## 5. Boss / 猎聘 / 智联消息协议
 
 | type | 作用 |
 |------|------|
-| `CL_PING` | 探测脚本是否注入 |
-| `CL_VISIBILITY` | 页面是否可见（不可见则暂停） |
-| `CL_BLOCKER` | 是否验证码文案 |
-| `CL_LIST` | 返回列表卡片数组 |
-| `CL_OPEN_INDEX` | 点击第 i 条并等详情 |
-| `CL_SCRAPE_DETAIL` | 刮当前详情 |
-| `CL_FAVORITE` | 未收藏则点收藏 |
-| `CL_SCROLL` | 列表容器缓慢下滚 |
+| `CL_PING` / `CL_VISIBILITY` / `CL_BLOCKER` | 探测与暂停 |
+| `CL_LIST` / `CL_OPEN_INDEX` / `CL_SCRAPE_DETAIL` | 列表与详情 |
+| `CL_FAVORITE` / `CL_SCROLL` | 收藏与滚动 |
+| `CL_NEXT_PAGE` | 猎聘分页翻页（列表整页替换） |
 
-改平台时保持这套 type，只换实现。
+### 本地存储配额
+
+`chrome.storage.local` 默认约 10MB。断点若反复写入完整 JD 会触发 `Resource::kQuotaBytes quota exceeded`。  
+已启用 `unlimitedStorage`，并对 `cl_run_state` / `cl_list_session` 做结果压缩与去重；仍满时可点「从头」或清除扩展数据。
+
+### 猎聘风控注意
+
+- 猎聘约 15–20 条/页，靠页码翻页，不是无限下拉。  
+- 连开后台 `/job/` 详情过快易触发 `safe.liepin.com`「账号行为异常」短信验证。  
+- 侧栏对猎聘：条间隔约 8–14s、每 8 条休息约 45s；详情页若进风控则立即暂停。  
+- 建议本批≤8；触发后先完成短信验证再「继续/续跑」。
 
 ---
 
 ## 6. 本地开发步骤
 
-1. 改 `extension/` 下代码  
-2. `chrome://extensions` → career-lens → **重新加载**  
-3. Boss 页 **刷新**（content script 才会更新）  
-4. 侧边栏若缓存旧 UI，关闭再点图标打开  
+1. 改 `extension/`  
+2. `chrome://extensions` → **重新加载**（权限含 `unlimitedStorage` 时需确认）  
+3. 招聘站页面 **刷新**  
+4. 侧边栏关掉再开  
 
-更新 pdf.js（可选）：
-
-```bash
-npm install pdfjs-dist@4.10.38
-cp node_modules/pdfjs-dist/build/pdf.min.mjs extension/vendor/pdfjs/
-cp node_modules/pdfjs-dist/build/pdf.worker.min.mjs extension/vendor/pdfjs/
-```
+若日志出现 `Resource::kQuotaBytes quota exceeded`：已做压缩仍满时，点「从头」或扩展页清除本扩展数据。
 
 ---
 
-## 7. 建议的微调顺序
+## 待办（Roadmap）
 
-1. 用「精确分析」粘贴 2～3 个真实 JD，看分项是否合理  
-2. 调画像权重 / 标签，而不是先改代码  
-3. 仍不准再改 `scoring.js`  
-4. 列表刮不到再改 `content.js` 选择器  
+完整说明见 [CHANGELOG.md](./CHANGELOG.md)。当前优先：
+
+1. **评测集固化**（热力建造师、压裂英语、AI 漫剧、汽车悬架 PM、空岗套话、或选句、PM 隐含）  
+2. **语义缓存 / 本地 embedding**，降成本与 Key 依赖  
+3. **猎聘稳态**：可配间隔、翻页游标、风控后续跑体验  
+4. **断言证据链 UI**：JD↔简历逐条对照  
+5. **稀疏 JD / 中性维**再收紧；**UNKNOWN** 严/松可配  
+6. 侧写版本号；职业包保持轻量（展示 + 无 Key 兜底）  

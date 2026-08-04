@@ -2,19 +2,28 @@
  * 全局默认常量 —— 改默认避雷词 / 默认权重 / 模型从这里开始
  * UI 可覆盖；持久化见 storage.js
  */
+import {
+  DEFAULT_PILLAR_WEIGHTS,
+  normalizePillarWeights,
+  migrateWeightsToPillars
+} from "./pillars.js";
 
 export const DEFAULT_AVOID_TAGS = [
   "加班", "出差", "驻场", "外包", "派遣", "客服", "销售", "运维", "培训",
   "异地", "倒班", "夜班", "值班", "咨询", "电推", "应酬", "驾照"
 ];
 
+/** @deprecated 旧五维；新逻辑用 DEFAULT_PILLAR_WEIGHTS */
 export const DEFAULT_WEIGHTS = {
   skill: 40,
   industry: 20,
   direction: 15,
   certificate: 15,
-  language: 10
+  language: 10,
+  ...DEFAULT_PILLAR_WEIGHTS
 };
+
+export { DEFAULT_PILLAR_WEIGHTS };
 
 export const DEFAULT_SETTINGS = {
   /** 当前启用的模型：deepseek | qwen | hunyuan | openai | gemini */
@@ -37,9 +46,12 @@ export const DEFAULT_SETTINGS = {
   exportFormat: "md",
   /** 已废弃：始终不拦截 */
   directionStrict: false,
-  minDetailWaitMs: 3000,
+  /** @deprecated 已改为详情就绪轮询 + 条末按总时长补间隔 */
+  minDetailWaitMs: 0,
   softSkillScore: false,
-  weights: { ...DEFAULT_WEIGHTS }
+  /** 有 Key 时用语义/向量打四维；无 Key 回退规则+职业包词表 */
+  semanticFit: true,
+  weights: { ...DEFAULT_PILLAR_WEIGHTS }
 };
 
 export const APPLY_LIST_MAX = 100;
@@ -57,19 +69,14 @@ export const DEFAULT_PROFILE = {
   avoidCustom: [],
   attentionSelected: [],
   attentionCustom: [],
-  resumeText: ""
+  resumeText: "",
+  /** 当前职业包（展示适合岗位；域词仅无模型时兜底） */
+  careerPackId: "it-delivery-pm",
+  /** 规则/AI 侧写结果（保存画像时一并写入） */
+  profileReport: null
 };
 
-/** 合计须为 100 才采用；否则回退默认权重（不自动归一） */
+/** 四维权重合计须为 100；兼容旧五维字段 */
 export function normalizeWeights(weights) {
-  const w = { ...DEFAULT_WEIGHTS, ...weights };
-  const out = {};
-  let sum = 0;
-  for (const k of Object.keys(DEFAULT_WEIGHTS)) {
-    const n = Number(w[k]);
-    out[k] = Number.isFinite(n) ? n : DEFAULT_WEIGHTS[k];
-    sum += out[k];
-  }
-  if (sum === 100) return out;
-  return { ...DEFAULT_WEIGHTS };
+  return normalizePillarWeights(migrateWeightsToPillars(weights));
 }

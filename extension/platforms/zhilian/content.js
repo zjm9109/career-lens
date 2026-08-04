@@ -184,6 +184,9 @@
           case "CL_SCROLL":
             sendResponse(await scrollList());
             break;
+          case "CL_NEXT_PAGE":
+            sendResponse({ ok: false, grew: false, reason: "智联当前走下拉补齐" });
+            break;
           default:
             sendResponse({ ok: false, reason: "unknown type" });
         }

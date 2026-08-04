@@ -1,6 +1,7 @@
 import { compactAnalysis, normalizeSalary } from "./job-sections.js";
 import {
   REC,
+  REC_ORDER,
   enrichResult,
   estimateDeepseekCost,
   groupResultsByRecommendation,
@@ -37,7 +38,19 @@ export function sortResults(results) {
 
 function statusLine(score, recommendation) {
   if (score.excluded || recommendation === REC.EXCLUDE) {
-    return `已排除（规则分 ${score.total ?? 0}% 仅供参考，因避雷未进入 DeepSeek/收藏）`;
+    return `已排除（规则分 ${score.total ?? 0}% 仅供参考，因避雷未进入模型/收藏）`;
+  }
+  if (recommendation === REC.REVIEW) {
+    const fit = score.fitTotal != null ? `，契合原分 ${score.fitTotal}%` : "";
+    const gate =
+      score.gateStatus === "fail"
+        ? `硬门槛未过（展示分 ${score.total ?? 0}%${fit}）`
+        : `展示分偏低（${score.total ?? 0}%${fit}）`;
+    return `待复核 · ${gate}`;
+  }
+  if (score.gateStatus === "fail") {
+    const fit = score.fitTotal != null ? `，契合原分 ${score.fitTotal}%` : "";
+    return `硬门槛未过（展示分 ${score.total ?? 0}%${fit}）`;
   }
   if (recommendation === REC.CAUTION) return "谨慎投递";
   if (recommendation === REC.SUGGEST) return "建议投递";
@@ -87,16 +100,63 @@ function pushJobMarkdown(lines, r, idx, mode) {
   lines.push(`- 链接：${esc(job.url || "-")}`);
   lines.push(`- 结果：${statusLine(score, rec)}`);
   lines.push(`- 匹配度：${score.total ?? 0}%`);
+  if (score.fitTotal != null && score.fitTotal !== score.total) {
+    lines.push(`- 契合原分：${score.fitTotal}%`);
+  }
+  if (score.jdConcrete) {
+    lines.push(
+      `- JD具体度：${score.jdConcrete.score}` +
+        (score.jdConcrete.reasons?.length
+          ? `（${score.jdConcrete.reasons.slice(0, 3).join("；")}）`
+          : "")
+    );
+  }
+  if (rec === REC.REVIEW) lines.push(`- 防漏：待复核（请人工确认）`);
+  if (score.gateStatus === "fail") {
+    lines.push(
+      `- 门禁：硬门槛未过` +
+        (score.fitTotal != null ? `（契合原分 ${score.fitTotal}%）` : "") +
+        (score.gateFailed?.length ? `；${score.gateFailed.join("；")}` : "")
+    );
+  } else if (score.gateLabel) {
+    lines.push(`- 门禁：${score.gateLabel}`);
+  }
   if (r.durationMs != null) lines.push(`- 生成时长：${formatDuration(r.durationMs)}`);
   if (score.avoidHits?.length) lines.push(`- 避雷命中：${score.avoidHits.join("、")}`);
   if (score.attentionHits?.length) lines.push(`- 注意项：${score.attentionHits.join("、")}`);
   if (score.hardGaps?.length) lines.push(`- 硬门槛缺口：${score.hardGaps.join("；")}`);
+  const req = score.requirements || {};
+  if (req.must?.length) lines.push(`- 必备能力：${esc(req.must.slice(0, 16).join("、"))}`);
+  if (req.mustMiss?.length) lines.push(`- 必备未满足：${esc(req.mustMiss.slice(0, 12).join("、"))}`);
+  if (req.preferred?.length) {
+    lines.push(
+      `- 优先项：${esc(req.preferred.slice(0, 10).join("、"))}` +
+        (req.preferredMiss?.length ? `（未命中：${esc(req.preferredMiss.slice(0, 8).join("、"))}）` : "")
+    );
+  }
+  if (req.bonus?.length) {
+    lines.push(
+      `- 加分项标签：${esc(req.bonus.slice(0, 10).join("、"))}` +
+        (req.bonusMiss?.length ? `（未命中：${esc(req.bonusMiss.slice(0, 8).join("、"))}）` : "")
+    );
+  }
   if (r.favorited) lines.push(`- 收藏：已自动收藏`);
   if (r.skippedDeepseek) lines.push(`- 模型：未调用（${esc(r.skippedDeepseek)}）`);
   if (r.llmLabel && r.analysis) lines.push(`- 模型：${esc(r.llmLabel)}`);
-  lines.push(
-    `- 分项：技能 ${dims.skill?.score ?? "-"} | 行业 ${dims.industry?.score ?? "-"} | 方向 ${dims.direction?.score ?? "-"} | 证书 ${dims.certificate?.score ?? "-"} | 语言 ${dims.language?.score ?? "-"}`
-  );
+  if (score.pillars) {
+    const p = score.pillars;
+    lines.push(
+      `- 四维：角色 ${p.role?.score ?? "-"} | 领域 ${p.domain?.score ?? "-"} | 能力 ${p.capability?.score ?? "-"} | 资质 ${p.qualify?.score ?? "-"}` +
+        (score.scoreMode ? `（${score.scoreMode}）` : "")
+    );
+    if (score.semantic?.jobDomain) {
+      lines.push(`- 领域识别：岗位「${esc(score.semantic.jobDomain)}」/ 简历「${esc(score.semantic.resumeDomain || "-")}」`);
+    }
+  } else {
+    lines.push(
+      `- 分项：技能 ${dims.skill?.score ?? "-"} | 行业 ${dims.industry?.score ?? "-"} | 方向 ${dims.direction?.score ?? "-"} | 证书 ${dims.certificate?.score ?? "-"} | 语言 ${dims.language?.score ?? "-"}`
+    );
+  }
   if (job.keywords?.length) lines.push(`- 职位标签：${esc(job.keywords.join("、"))}`);
   if (r.analysis) {
     lines.push(`- 分析结果：`);
@@ -129,7 +189,7 @@ function buildGroupedMarkdown(results, mode) {
   const modeLabel = mode === "detailed" ? "详细" : "精简";
   const lines = [`# career-lens 精筛结果`, ``, ...metaLines(enriched, modeLabel, null), ``];
 
-  for (const title of [REC.SUGGEST, REC.CAUTION, REC.EXCLUDE]) {
+  for (const title of REC_ORDER) {
     const list = buckets[title] || [];
     lines.push(``);
     lines.push(`# ${title}（${list.length}）`);
@@ -168,7 +228,7 @@ export function resultsToPlainParagraphs(results, { mode = "simple", deepseekCal
     ""
   ];
 
-  for (const title of [REC.SUGGEST, REC.CAUTION, REC.EXCLUDE]) {
+  for (const title of REC_ORDER) {
     const list = buckets[title] || [];
     paras.push(`【${title}】（${list.length}）`);
     paras.push("");
@@ -192,13 +252,54 @@ export function resultsToPlainParagraphs(results, { mode = "simple", deepseekCal
       paras.push(`链接：${job.url || "-"}`);
       paras.push(`结果：${statusLine(score, rec)}`);
       paras.push(`匹配度：${score.total ?? 0}%`);
+      if (score.fitTotal != null && score.fitTotal !== score.total) {
+        paras.push(`契合原分：${score.fitTotal}%`);
+      }
+      if (rec === REC.REVIEW) paras.push(`防漏：待复核（请人工确认）`);
+      if (score.gateStatus === "fail") {
+        paras.push(
+          `门禁：硬门槛未过` +
+            (score.fitTotal != null ? `（契合原分 ${score.fitTotal}%）` : "") +
+            (score.gateFailed?.length ? `；${score.gateFailed.join("；")}` : "")
+        );
+      } else if (score.gateLabel) {
+        paras.push(`门禁：${score.gateLabel}`);
+      }
       if (r.durationMs != null) paras.push(`生成时长：${formatDuration(r.durationMs)}`);
       if (score.avoidHits?.length) paras.push(`避雷：${score.avoidHits.join("、")}`);
       if (score.attentionHits?.length) paras.push(`注意：${score.attentionHits.join("、")}`);
       if (score.hardGaps?.length) paras.push(`硬门槛缺口：${score.hardGaps.join("；")}`);
-      paras.push(
-        `分项：技能 ${dims.skill?.score ?? "-"} | 行业 ${dims.industry?.score ?? "-"} | 方向 ${dims.direction?.score ?? "-"} | 证书 ${dims.certificate?.score ?? "-"} | 语言 ${dims.language?.score ?? "-"}`
-      );
+      const req = score.requirements || {};
+      if (req.must?.length) paras.push(`必备能力：${req.must.slice(0, 16).join("、")}`);
+      if (req.mustMiss?.length) paras.push(`必备未满足：${req.mustMiss.slice(0, 12).join("、")}`);
+      if (req.preferred?.length) {
+        paras.push(
+          `优先项：${req.preferred.slice(0, 10).join("、")}` +
+            (req.preferredMiss?.length ? `（未命中：${req.preferredMiss.slice(0, 8).join("、")}）` : "")
+        );
+      }
+      if (req.bonus?.length) {
+        paras.push(
+          `加分项标签：${req.bonus.slice(0, 10).join("、")}` +
+            (req.bonusMiss?.length ? `（未命中：${req.bonusMiss.slice(0, 8).join("、")}）` : "")
+        );
+      }
+      if (score.pillars) {
+        const p = score.pillars;
+        paras.push(
+          `四维：角色 ${p.role?.score ?? "-"} | 领域 ${p.domain?.score ?? "-"} | 能力 ${p.capability?.score ?? "-"} | 资质 ${p.qualify?.score ?? "-"}` +
+            (score.scoreMode ? `（${score.scoreMode}）` : "")
+        );
+        if (score.semantic?.jobDomain) {
+          paras.push(
+            `领域识别：岗位「${score.semantic.jobDomain}」/ 简历「${score.semantic.resumeDomain || "-"}」`
+          );
+        }
+      } else {
+        paras.push(
+          `分项：技能 ${dims.skill?.score ?? "-"} | 行业 ${dims.industry?.score ?? "-"} | 方向 ${dims.direction?.score ?? "-"} | 证书 ${dims.certificate?.score ?? "-"} | 语言 ${dims.language?.score ?? "-"}`
+        );
+      }
       if (job.keywords?.length) paras.push(`职位标签：${job.keywords.join("、")}`);
       if (r.llmLabel && r.analysis) paras.push(`模型：${r.llmLabel}`);
       if (r.analysis) {
@@ -423,4 +524,107 @@ export async function downloadResults(results, { mode = "simple", format = "md",
   const md = resultsToMarkdown(results, { mode, deepseekCalls });
   await downloadMarkdown(md, filename);
   return { filename };
+}
+
+function csvEscape(val) {
+  const s = String(val ?? "");
+  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function formatLocalTime(ts) {
+  if (!ts) return "";
+  try {
+    return new Date(ts).toLocaleString("zh-CN", { hour12: false });
+  } catch {
+    return String(ts);
+  }
+}
+
+function applySourceLabel(row) {
+  const p = row?.platform;
+  if (p === "manual") return "精确";
+  if (p === "boss") return "BOSS";
+  if (p === "liepin") return "猎聘";
+  if (p === "zhilian") return "智联";
+  if (row?.source === "manual") return "精确";
+  const url = row?.url || "";
+  if (/zhipin\.com|bosszhipin/i.test(url)) return "BOSS";
+  if (/liepin\.com/i.test(url)) return "猎聘";
+  if (/zhaopin\.com/i.test(url)) return "智联";
+  return "";
+}
+
+/** 投递列表 → UTF-8 BOM CSV（Excel 可直接打开） */
+export function applyListToCsv(rows) {
+  const headers = [
+    "岗位名称",
+    "公司",
+    "链接",
+    "展示匹配度",
+    "契合原分",
+    "建议分组",
+    "是否待复核",
+    "门禁状态",
+    "门禁失败项",
+    "硬门槛缺口",
+    "必备未满足",
+    "注意项",
+    "来源",
+    "是否打开过",
+    "打开状态",
+    "入列时间",
+    "最近更新时间",
+    "分析摘要"
+  ];
+  const lines = [headers.map(csvEscape).join(",")];
+  const sorted = [...(rows || [])].sort((a, b) => {
+    const sa = a.effectiveScore ?? a.fitTotal ?? a.total ?? 0;
+    const sb = b.effectiveScore ?? b.fitTotal ?? b.total ?? 0;
+    if (sb !== sa) return sb - sa;
+    return (b.createdAt || 0) - (a.createdAt || 0);
+  });
+  for (const row of sorted) {
+    const opened = row.applyStatus === "已打开" ? "是" : "否";
+    const gateLabel =
+      row.gateStatus === "fail"
+        ? "硬门槛未过"
+        : row.gateStatus === "pass"
+          ? "硬门槛通过"
+          : row.gateLabel || "";
+    const analysis = compactAnalysis(row.analysis || "").slice(0, 500).replace(/\n+/g, "；");
+    lines.push(
+      [
+        row.title || "",
+        row.company || "",
+        row.url || "",
+        row.total ?? "",
+        row.fitTotal ?? row.effectiveScore ?? "",
+        row.recommendation || "",
+        row.reviewFlag || row.recommendation === REC.REVIEW ? "是" : "否",
+        gateLabel,
+        (row.gateFailed || []).join("；"),
+        (row.hardGaps || []).join("；"),
+        (row.mustMiss || []).join("；"),
+        (row.attentionHits || []).join("；"),
+        applySourceLabel(row),
+        opened,
+        row.applyStatus || "未打开",
+        formatLocalTime(row.createdAt),
+        formatLocalTime(row.updatedAt),
+        analysis
+      ]
+        .map(csvEscape)
+        .join(",")
+    );
+  }
+  return `\uFEFF${lines.join("\r\n")}`;
+}
+
+export async function downloadApplyListExcel(rows) {
+  const filename = makeFilename("career-lens-投递列表", "csv");
+  const csv = applyListToCsv(rows);
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  await downloadBlob(blob, filename);
+  return { filename, count: (rows || []).length };
 }

@@ -33,13 +33,31 @@ export function normalizeSalary(salary) {
   return s.replace(/\s+/g, "");
 }
 
-function stripNoise(text) {
+/** Boss 反爬常在汉字间插入「直聘」，如「AI漫直聘剧」→「AI漫剧」 */
+export function denoiseJobText(text) {
   let s = String(text || "");
+  s = s.replace(/直聘/g, "");
+  s = s.replace(/⼯/g, "工").replace(/⽬/g, "目").replace(/⾼/g, "高");
+  return s;
+}
+
+function stripNoise(text) {
+  let s = denoiseJobText(text);
   s = s.replace(/\.[A-Za-z0-9_-]{2,80}\s*\{[^}]*\}/g, " ");
   s = s.replace(/来自BOSS直聘|BOSS直聘|kanzhun|\bboss\b/gi, "");
+  // 上面 denoise 已去「直聘」，再清残留品牌词
+  s = s.replace(/来自BOSS|BOSS/gi, "");
   s = s.replace(/收藏\s*立即沟通\s*举报[\s\S]{0,30}不合适/g, "\n");
-  s = s.replace(/微信扫码分享/g, "");
+  s = s.replace(/微信扫码分享|微信分享扫码/g, "");
+  // 猎聘顶栏很长，不能用过短窗口
+  s = s.replace(/首页\s*职位\s*校园[\s\S]{0,400}?我的沟通/g, "\n");
+  s = s.replace(/投简历|聊一聊|当前在线|已认证/g, " ");
   s = s.replace(HR_TAIL_RE, "");
+  // 从「职位介绍」起算职责（丢掉标题区福利 chips）
+  {
+    const intro = s.search(/职位介绍|主要职责描述|岗位职责|工作职责|任职要求/);
+    if (intro > 0) s = s.slice(intro);
+  }
   const cutMarks = [
     "求职工具",
     "热门职位",
@@ -49,7 +67,12 @@ function stripNoise(text) {
     "去App与",
     "前往App与",
     "查看更多信息",
-    "点击查看地图"
+    "点击查看地图",
+    "公司简介",
+    "猎聘温馨提示",
+    "猜你喜欢",
+    "推荐企业",
+    "相似职位"
   ];
   let cutAt = -1;
   for (const m of cutMarks) {
@@ -94,12 +117,15 @@ export function parseJobSections(rawDescription, domKeywords = []) {
   let text = stripNoise(rawDescription);
   text = text.replace(/^职位描述\s*/g, "");
 
+  const welfareRe =
+    /^(五险一金|绩效奖金|年终奖金|带薪年假|定期体检|节日礼物|团队聚餐|餐费补贴|通讯津贴|提供住宿|外派津贴|弹性工作|扁平管理|领导好|发展空间大|公司规模大|优秀员工奖|加班补助|股票期权|补充医疗|交通补助|住房补贴|双休|周末双休|包吃|包住)$/;
   let keywords = [...(domKeywords || [])]
     .map((k) => String(k || "").replace(/["""'']/g, "").trim())
     .filter((k) => {
       if (!k || k.length < 2 || k.length > 16) return false;
       if (/^[一二三四五六七八九十]+[、.．]?$/.test(k)) return false;
       if (/持\/交付|PMPPMP/.test(k)) return false;
+      if (welfareRe.test(k)) return false;
       return /[\u4e00-\u9fffA-Za-z]/.test(k);
     });
   keywords = [...new Set(keywords)];
@@ -123,10 +149,15 @@ export function parseJobSections(rawDescription, domKeywords = []) {
   let bonus = "";
 
   const reqIdx = text.search(/任职要求|任职资格|岗位要求|职位要求/);
-  const dutyIdx = text.search(/岗位职责|工作职责|职位描述：|岗位描述/);
+  const dutyIdx = text.search(/岗位职责|工作职责|职位介绍|主要职责|职位描述：|岗位描述/);
 
   if (reqIdx >= 0) {
     let afterReq = text.slice(reqIdx).replace(/^(任职要求|任职资格|岗位要求|职位要求)[：:\s]*/, "");
+    // 猎聘「其他信息」之后多为语言/行业标签，保留在任职里；公司简介已在 stripNoise 裁掉
+    const otherIdx = afterReq.search(/\n?其他信息/);
+    if (otherIdx > 40) {
+      // 保留其他信息中的语言/行业，一并留在 requirements
+    }
     const bonusInReq = afterReq.search(/\n?加分项[：:]/);
     if (bonusInReq >= 0) {
       bonus = afterReq.slice(bonusInReq).replace(/^\n?加分项[：:]\s*/, "").trim();
@@ -136,12 +167,13 @@ export function parseJobSections(rawDescription, domKeywords = []) {
     requirements = afterReq.trim();
     const before = dutyIdx >= 0 && dutyIdx < reqIdx ? text.slice(0, reqIdx) : text.slice(0, reqIdx);
     responsibilities = before
-      .replace(/^(岗位职责|工作职责|职位描述：|岗位描述)[：:\s]*/, "")
+      .replace(/^(职位介绍|岗位职责|工作职责|主要职责描述|职位描述：|岗位描述)[：:\s]*/, "")
+      .replace(/^主要职责描述[：:\s]*/, "")
       .trim();
   } else if (dutyIdx >= 0) {
     responsibilities = text
       .slice(dutyIdx)
-      .replace(/^(岗位职责|工作职责|职位描述：|岗位描述)[：:\s]*/, "")
+      .replace(/^(职位介绍|岗位职责|工作职责|主要职责描述|职位描述：|岗位描述)[：:\s]*/, "")
       .trim();
   } else {
     responsibilities = text;

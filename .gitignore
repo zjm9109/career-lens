@@ -6,8 +6,12 @@ node_modules/
 .env
 .env.*
 *.pem
-# 个人简历等隐私文件，勿提交
-docs/*.pdf
-docs/*.docx
+
+# docs 仅提交说明书；简历 PDF、精筛导出、运行日志等私密/本地文件不提交
+docs/**
 !docs/SPEC.md
 !docs/TECH.md
+!docs/CHANGELOG.md
+
+# 安装截图在仓库根目录 images/（可提交）；勿再提交 docs/images
+docs/images/

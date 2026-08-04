@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "career-lens",
-  "version": "0.2.0",
-  "description": "Boss/猎聘/智联粗筛后的本地精筛：避雷 / 加分 / 多模型分析 / 导出",
-  "permissions": ["storage", "sidePanel", "downloads", "scripting", "tabs", "activeTab"],
+  "version": "0.3.0",
+  "description": "Boss/猎聘/智联粗筛后的本地精筛：硬门槛门禁 / 契合分 / 多模型分析 / 导出",
+  "permissions": ["storage", "unlimitedStorage", "sidePanel", "downloads", "scripting", "tabs", "activeTab"],
   "host_permissions": [
     "https://www.zhipin.com/*",
     "https://www.bosszhipin.com/*",
